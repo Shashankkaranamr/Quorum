@@ -1,0 +1,49 @@
+# Quorum cluster topology -- static membership.
+#
+# Every node reads this same file and learns the full peer set from it. There is
+# no dynamic membership: the cluster size is fixed for the lifetime of the
+# cluster. That is a deliberate scope decision, documented in DESIGN.md.
+#
+# Decoding is strict. An unrecognized key is an error, not a silently ignored
+# typo, because a misspelled timeout that quietly falls back to a default shows
+# up later as erratic elections and gets blamed on the consensus code.
+
+cluster_id: quorum-local
+
+# Three nodes: quorum of 2, tolerates 1 failure. Use cluster-5.yaml for a
+# five-node cluster that tolerates 2.
+nodes:
+  # grpc_port serves the Raft peer transport, the client KV API and the admin
+  # API on one listener. http_port serves status and metrics, and is what the
+  # visualizer scrapes.
+  - {id: 1, host: 127.0.0.1, grpc_port: 7001, http_port: 8001}
+  - {id: 2, host: 127.0.0.1, grpc_port: 7002, http_port: 8002}
+  - {id: 3, host: 127.0.0.1, grpc_port: 7003, http_port: 8003}
+
+raft:
+  # The consensus core counts ticks and has no clock of its own; the driver
+  # decides how long a tick lasts. This is what lets the deterministic
+  # simulator run a sixty-second election scenario in microseconds.
+  tick_ms: 50
+
+  # Randomized election timeout, in ticks: 500ms to 1000ms at tick_ms: 50.
+  # The range must be non-empty, or nodes time out together and split the vote
+  # repeatedly. It must also be comfortably larger than the heartbeat interval
+  # (Raft's broadcastTime << electionTimeout requirement), or ordinary
+  # scheduling jitter triggers spurious elections. Validation enforces >= 3x.
+  election_timeout_min_ticks: 10
+  election_timeout_max_ticks: 20
+
+  # Leader sends AppendEntries every 3 ticks (150ms).
+  heartbeat_timeout_ticks: 3
+
+  # Applied entries past the last snapshot before a new snapshot is taken.
+  snapshot_threshold_entries: 10000
+
+  # Cap on entries in one AppendEntries batch.
+  max_entries_per_append: 256
+
+storage:
+  # Each node gets <data_dir>/node-<id> for its WAL and snapshots.
+  data_dir: ./data
+  wal_segment_bytes: 16777216 # 16 MiB

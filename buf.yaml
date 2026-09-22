@@ -1,0 +1,42 @@
+# buf compiles the .proto files without a native protoc install, which matters
+# because this project has to build on a clean Windows machine with nothing but
+# the Go toolchain.
+version: v2
+
+modules:
+  - path: proto
+
+lint:
+  use:
+    - STANDARD
+  except:
+    # Each exception below is a naming convention, not a correctness rule. The
+    # rules that catch real mistakes -- package/directory agreement, enum zero
+    # values, field naming, reserved ranges -- all stay on.
+
+    # SERVICE_SUFFIX wants KVService, AdminService, RaftTransportService.
+    # `KV` and `Admin` read better at the call site and match the naming etcd
+    # uses for the same concepts. The suffix carries no information here.
+    - SERVICE_SUFFIX
+
+    # RPC_REQUEST_STANDARD_NAME / RPC_RESPONSE_STANDARD_NAME want every RPC to
+    # have types named <Rpc>Request and <Rpc>Response. RaftTransport.Stream
+    # carries `Message`, which is the domain type: a Raft message is not a
+    # "StreamRequest", and renaming it would obscure that the same type goes
+    # on the wire, into the WAL, and through the deterministic simulator.
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+
+    # RPC_REQUEST_RESPONSE_UNIQUE wants a distinct type per RPC. GetStatus and
+    # WatchStatus deliberately return the same NodeStatus: a snapshot and a
+    # stream of snapshots should not be able to drift apart in shape, because
+    # the visualizer renders both through one code path.
+    - RPC_REQUEST_RESPONSE_UNIQUE
+
+breaking:
+  # The write-ahead log on disk uses these same messages. A breaking change to
+  # a field number does not just break a client, it makes every WAL written
+  # before the change unreadable -- which would silently destroy the durability
+  # guarantee the whole project is about.
+  use:
+    - FILE

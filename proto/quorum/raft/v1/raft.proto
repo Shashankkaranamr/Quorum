@@ -1,0 +1,229 @@
+// Raft consensus wire format and write-ahead log format.
+//
+// These are the same types in both places on purpose. A log entry that travels
+// in an AppendEntries and a log entry that lands in the WAL are encoded
+// identically, so there is exactly one serialization to get right and exactly
+// one to fuzz.
+//
+// The consensus core in package raft does NOT import these types. It works with
+// plain Go structs, and internal/pbconv translates at the boundary. That is
+// what keeps "the core performs no I/O" checkable by reading one import list
+// (see raft/purity_test.go).
+syntax = "proto3";
+
+package quorum.raft.v1;
+
+option go_package = "github.com/Shashankkaranamr/Quorum/gen/quorum/raft/v1;raftv1";
+
+// EntryType distinguishes the kinds of thing that can occupy a log index.
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+
+  // A client command. The payload is a quorum.kv.v1.Command.
+  ENTRY_TYPE_NORMAL = 1;
+
+  // An empty entry a leader appends immediately on election.
+  //
+  // Raft forbids committing an entry from a previous term by counting
+  // replicas (section 5.4.2). A new leader therefore cannot learn its true
+  // commit index until it commits something from its own term, and until it
+  // knows its commit index it cannot serve a linearizable read. The no-op is
+  // how it finds out, which is why ReadIndex depends on it.
+  ENTRY_TYPE_NOOP = 2;
+
+  // Registers a client session. The payload is a
+  // quorum.kv.v1.RegisterClientCommand, and the resulting client id is the
+  // log index of this entry -- which makes it unique across the cluster
+  // without any coordination or randomness.
+  ENTRY_TYPE_SESSION = 3;
+
+  // Reserved for a membership change. Not implemented: Quorum uses static
+  // membership (see DESIGN.md). It is enumerated now so that adding dynamic
+  // membership later does not require a log format change, which would break
+  // compatibility with every WAL written before it.
+  ENTRY_TYPE_CONFIG = 4;
+}
+
+// Entry is one slot in the replicated log.
+//
+// Index and term together identify an entry uniquely across the whole cluster
+// for all time. That pair is what the Log Matching property is stated in terms
+// of, and what AppendEntries consistency checks compare.
+message Entry {
+  uint64 term = 1;
+  uint64 index = 2;
+  EntryType type = 3;
+  bytes data = 4;
+}
+
+// HardState is the part of a node's state that must be durable before the node
+// acts on it. Losing any of it after a crash can violate safety directly:
+// forgetting a vote lets a node vote twice in one term and elect two leaders.
+message HardState {
+  uint64 term = 1;
+
+  // voted_for is 0 when no vote has been cast in this term. Node ids start at
+  // 1, so zero is unambiguous.
+  uint64 voted_for = 2;
+
+  // commit is persisted as an optimization, not a requirement: it can always
+  // be recovered by replaying, but persisting it avoids re-deriving it.
+  uint64 commit = 3;
+}
+
+// SnapshotMetadata identifies the point in the log a snapshot replaces.
+message SnapshotMetadata {
+  uint64 last_included_index = 1;
+  uint64 last_included_term = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+// Message is the envelope for every Raft RPC.
+//
+// Raft messages are one-way. A request and its response are two independent
+// messages travelling over two independent directed links, rather than a
+// call and a return. That is what makes one-way partitions expressible: the
+// transport can cut A to B while leaving B to A intact, which is where the
+// subtler consensus bugs live.
+message Message {
+  uint64 from = 1;
+  uint64 to = 2;
+
+  // term is on the envelope because every Raft message carries the sender's
+  // term and every receiver applies the same rule to it: if the term is
+  // greater than ours, step down and adopt it, before looking at the body.
+  uint64 term = 3;
+
+  oneof body {
+    RequestVote request_vote = 10;
+    RequestVoteResponse request_vote_response = 11;
+    AppendEntries append_entries = 12;
+    AppendEntriesResponse append_entries_response = 13;
+    InstallSnapshot install_snapshot = 14;
+    InstallSnapshotResponse install_snapshot_response = 15;
+  }
+}
+
+message RequestVote {
+  // The candidate's last log entry, used for the up-to-date check in section
+  // 5.4.1: a voter refuses a candidate whose log is behind its own. This is
+  // what guarantees Leader Completeness.
+  uint64 last_log_index = 1;
+  uint64 last_log_term = 2;
+}
+
+message RequestVoteResponse {
+  bool vote_granted = 1;
+}
+
+message AppendEntries {
+  // The entry immediately preceding the first of entries. The receiver refuses
+  // the append unless it has exactly this entry, which is the induction step
+  // that gives the Log Matching property.
+  uint64 prev_log_index = 1;
+  uint64 prev_log_term = 2;
+
+  repeated Entry entries = 3;
+  uint64 leader_commit = 4;
+
+  // read_context, when set, makes this heartbeat part of a ReadIndex
+  // confirmation round. The follower echoes it back untouched. Once a quorum
+  // has echoed the same context, the leader knows it was still leader at the
+  // moment it recorded its read index, and the read can be served without
+  // writing anything to the log.
+  bytes read_context = 5;
+}
+
+message AppendEntriesResponse {
+  bool success = 1;
+
+  // match_index is the highest index the follower now agrees with, set only
+  // when success is true. Sending it rather than inferring it from the
+  // request avoids a class of bug where a stale or reordered response
+  // advances the leader's view incorrectly.
+  uint64 match_index = 2;
+
+  // On rejection, conflict_term and conflict_index let the leader skip a whole
+  // conflicting term in one round trip instead of walking back one index at a
+  // time (the optimization sketched at the end of section 5.3). Without it, a
+  // follower that is a thousand entries behind costs a thousand round trips.
+  uint64 conflict_term = 3;
+  uint64 conflict_index = 4;
+
+  bytes read_context = 5;
+}
+
+// InstallSnapshot transfers state to a follower whose next index has already
+// been compacted away by the leader. Sent in chunks so a large snapshot does
+// not have to be held in memory or delivered in one message.
+message InstallSnapshot {
+  SnapshotMetadata metadata = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  bool done = 4;
+}
+
+message InstallSnapshotResponse {
+  // bytes_received lets the leader resume a transfer interrupted mid-stream
+  // rather than restarting it.
+  uint64 bytes_received = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Write-ahead log records
+// ---------------------------------------------------------------------------
+//
+// Framing is not protobuf: each record on disk is
+//
+//     [u32 length][u32 crc32c][u8 record type][payload]
+//
+// with the payload being one of the messages below. Protobuf is not
+// self-delimiting and gives no corruption detection, so the framing supplies
+// both. A torn tail is detected by the CRC and truncated, which is what makes
+// "recovery always yields a prefix of what was written" true rather than
+// hopeful.
+
+// WalEntryBatch is one Ready batch worth of appended entries. The batch is the
+// unit of atomicity: one batch, one fsync.
+message WalEntryBatch {
+  repeated Entry entries = 1;
+}
+
+// WalSnapshotPointer is appended and fsynced only after the snapshot file it
+// names has itself been written and fsynced. That ordering is what makes a
+// crash mid-snapshot recoverable: a pointer always names a complete file, and
+// a complete file with no pointer is simply ignored and overwritten later.
+message WalSnapshotPointer {
+  SnapshotMetadata metadata = 1;
+  string filename = 2;
+  uint32 crc32c = 3;
+  uint64 size_bytes = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+// RaftTransport carries messages between peers.
+//
+// One long-lived client stream per directed link: node A opens a Stream to
+// node B and pushes messages into it, and B opens its own Stream back to A for
+// the reverse direction. A directed link therefore maps 1:1 to a stream, so
+// injecting a one-way partition is exactly "close this stream and refuse to
+// accept a new one from that peer".
+//
+// Delivery is best effort by design. Dropping, delaying, duplicating or
+// reordering a message must never violate safety, only liveness -- and the
+// deterministic simulator does all four on purpose to prove it.
+service RaftTransport {
+  rpc Stream(stream Message) returns (StreamSummary);
+}
+
+// StreamSummary is returned when a stream closes. It exists for observability;
+// nothing in the consensus protocol depends on it.
+message StreamSummary {
+  uint64 messages_received = 1;
+}

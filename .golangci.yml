@@ -1,0 +1,69 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+issues:
+  # golangci-lint defaults to reporting at most 3 occurrences of the same issue
+  # and 50 per linter. Truncated output is how a real problem hides behind a
+  # cap, so both are disabled.
+  max-same-issues: 0
+  max-issues-per-linter: 0
+
+linters:
+  default: standard
+  enable:
+    # A distributed system fails in the error paths, so the linters that care
+    # about error handling earn their place here.
+    - errorlint # comparing wrapped errors with == instead of errors.Is
+    - bodyclose
+    - rowserrcheck
+    - nilerr # returning nil after checking err != nil
+
+    # Concurrency. The whole design rests on the consensus core being
+    # single-threaded and the driver owning it, so anything that quietly
+    # introduces shared state is worth hearing about early.
+    - copyloopvar
+    - contextcheck
+
+    - revive
+    - misspell
+    - unconvert
+    - wastedassign
+    - godot
+
+  settings:
+    errcheck:
+      # A failed write to stdout or stderr is not actionable from inside a CLI
+      # that is printing help or a warning: the process has nowhere to report
+      # it. Every other error return still has to be handled, including the
+      # ones on the durability path, which is where it actually matters.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+
+  exclusions:
+    # Generated protobuf code is machine output; linting it reports problems
+    # nobody can fix.
+    generated: strict
+    paths:
+      - gen
+    rules:
+      # Table-driven tests legitimately carry long literal blocks.
+      - path: _test\.go
+        linters:
+          - dupl
+          - gosec
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/Shashankkaranamr/Quorum
+  exclusions:
+    paths:
+      - gen

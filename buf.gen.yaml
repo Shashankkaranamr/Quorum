@@ -1,0 +1,15 @@
+version: v2
+
+# Generated code is checked in. A reader cloning the repo can build and test
+# without installing any protobuf tooling at all, and `make proto-check` proves
+# the checked-in output still matches the .proto sources.
+plugins:
+  - local: protoc-gen-go
+    out: gen
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: gen
+    opt: paths=source_relative
+
+inputs:
+  - directory: proto

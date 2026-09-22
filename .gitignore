@@ -1,0 +1,33 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go test / profiling artifacts
+*.test
+*.out
+coverage.*
+/testdata/fuzz/
+__debug_bin*
+
+# Runtime cluster state: WAL segments, snapshots, pidfiles, logs.
+# Never commit these -- they are per-machine and can be large.
+/data/
+*.wal
+*.snap
+*.pid
+
+# Visualizer frontend (phase 7) -- only if a bundler is ever introduced
+/node_modules/
+/web/dist/
+
+# Editors / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

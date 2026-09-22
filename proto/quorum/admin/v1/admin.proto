@@ -1,0 +1,193 @@
+// Node introspection and fault injection.
+//
+// The visualizer's buttons and the automated fault-injection suite both drive
+// this API. That is deliberate: if the demo had its own path, the thing being
+// demonstrated and the thing being tested could drift apart, and the demo would
+// slowly become a claim rather than evidence.
+syntax = "proto3";
+
+package quorum.admin.v1;
+
+option go_package = "github.com/Shashankkaranamr/Quorum/gen/quorum/admin/v1;adminv1";
+
+import "quorum/raft/v1/raft.proto";
+
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_FOLLOWER = 1;
+  ROLE_CANDIDATE = 2;
+  ROLE_LEADER = 3;
+}
+
+// PeerView is the leader's bookkeeping for one follower, plus link health.
+// Shown side by side in the visualizer, next_index and match_index diverging
+// is what catching-up looks like.
+message PeerView {
+  uint64 node_id = 1;
+  uint64 next_index = 2;
+  uint64 match_index = 3;
+
+  // reachable is false when the link is cut, either by a real network failure
+  // or by an injected partition. The node cannot tell those apart, which is
+  // the point.
+  bool reachable = 4;
+
+  int64 ms_since_last_contact = 5;
+
+  // blocked_by_injection distinguishes "this link was deliberately cut by the
+  // fault injector" from "this link is just down", which matters when reading
+  // the visualizer but must never be visible to the consensus core.
+  bool blocked_by_injection = 6;
+}
+
+// LogEntryView is a display-sized summary of a log entry. The raw payload is
+// deliberately not included: the visualizer renders hundreds of these and does
+// not need the bytes.
+message LogEntryView {
+  uint64 index = 1;
+  uint64 term = 2;
+  quorum.raft.v1.EntryType type = 3;
+
+  // summary is a short human-readable rendering, e.g. `put user:1 = "alice"`.
+  string summary = 4;
+
+  bool committed = 5;
+  bool applied = 6;
+}
+
+// Metrics are the numbers that make the known hazards observable rather than
+// theoretical.
+message Metrics {
+  // fsync_count and fsync_p99_micros exist because durability is claimed, and
+  // a claim about fsync that nothing counts is unverifiable. A phase 3 test
+  // asserts exactly one fsync per Ready batch.
+  uint64 fsync_count = 1;
+  uint64 fsync_p99_micros = 2;
+
+  // tick_lag_ticks is how far behind schedule the driver loop is running.
+  //
+  // This is the direct measurement of the failure mode DESIGN.md flags: one
+  // goroutine owns ticks, messages and durability, so a slow fsync delays
+  // ticks and can stall elections. That is the same symptom as the classic
+  // "held a lock across I/O" bug, and this is the number that would show it.
+  uint64 tick_lag_ticks = 3;
+
+  uint64 proposals_accepted = 4;
+  uint64 proposals_rejected = 5;
+  uint64 messages_sent = 6;
+  uint64 messages_received = 7;
+  uint64 elections_started = 8;
+  uint64 snapshots_taken = 9;
+}
+
+message NodeStatus {
+  uint64 node_id = 1;
+  Role role = 2;
+  uint64 term = 3;
+  uint64 voted_for = 4;
+  uint64 leader_id = 5;
+
+  uint64 commit_index = 6;
+  uint64 last_applied = 7;
+  uint64 last_log_index = 8;
+  uint64 last_log_term = 9;
+  uint64 snapshot_index = 10;
+
+  repeated PeerView peers = 11;
+
+  // log_tail is the most recent entries, newest last. Bounded by the request.
+  repeated LogEntryView log_tail = 12;
+
+  Metrics metrics = 13;
+
+  // frozen is true when the driver event loop has been parked by Freeze. The
+  // process is alive and the socket is still accepting; nothing is being
+  // processed. From the cluster's point of view that is a faithful freeze,
+  // though it is cooperative rather than SIGSTOP.
+  bool frozen = 14;
+
+  int64 uptime_ms = 15;
+  int64 observed_at_unix_ms = 16;
+}
+
+message GetStatusRequest {
+  // log_tail_limit caps how many recent entries to include. Zero means none.
+  uint32 log_tail_limit = 1;
+}
+
+message WatchStatusRequest {
+  uint32 log_tail_limit = 1;
+
+  // min_interval_ms throttles the stream. The visualizer asks for updates at
+  // most every 100ms or so; it does not need every state transition, and the
+  // consensus loop must never be slowed down to feed a UI.
+  uint32 min_interval_ms = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Fault injection
+// ---------------------------------------------------------------------------
+//
+// Partitions are enforced in this node's transport layer: streams to blocked
+// peers are closed and new connections from them are rejected. Real sockets
+// really close, and the consensus core cannot distinguish an injected
+// partition from a severed cable.
+//
+// It is not a kernel firewall rule, and DESIGN.md and the README both say so.
+// A reviewer should know the difference rather than infer something stronger
+// from the demo.
+//
+// Killing a node is NOT here: a process cannot be asked to be SIGKILLed. That
+// belongs to the supervisor, and it is a real TerminateProcess/SIGKILL with no
+// graceful shutdown, because recovery has to be exercised against an abrupt
+// failure rather than a polite one.
+
+message BlockLinksRequest {
+  // peer_ids to stop exchanging messages with.
+  repeated uint64 peer_ids = 1;
+
+  // inbound_only and outbound_only make one-way partitions expressible. A link
+  // cut in one direction only is where the subtler consensus bugs live: a
+  // leader that can still send heartbeats but cannot hear acknowledgements
+  // behaves very differently from one that is fully isolated.
+  //
+  // Both false means cut both directions.
+  bool inbound_only = 2;
+  bool outbound_only = 3;
+}
+
+message BlockLinksResponse {
+  repeated uint64 blocked_peer_ids = 1;
+}
+
+message HealRequest {}
+
+message HealResponse {
+  repeated uint64 unblocked_peer_ids = 1;
+}
+
+message FreezeRequest {
+  // auto_thaw_after_ms parks the loop for a bounded time, so a scripted demo
+  // or a test cannot leave a node wedged forever if it fails partway. Zero
+  // means freeze until Thaw is called.
+  uint32 auto_thaw_after_ms = 1;
+}
+
+message FreezeResponse {}
+
+message ThawRequest {}
+
+message ThawResponse {
+  uint64 frozen_for_ms = 1;
+  uint64 ticks_missed = 2;
+}
+
+service Admin {
+  rpc GetStatus(GetStatusRequest) returns (NodeStatus);
+  rpc WatchStatus(WatchStatusRequest) returns (stream NodeStatus);
+
+  rpc BlockLinks(BlockLinksRequest) returns (BlockLinksResponse);
+  rpc Heal(HealRequest) returns (HealResponse);
+  rpc Freeze(FreezeRequest) returns (FreezeResponse);
+  rpc Thaw(ThawRequest) returns (ThawResponse);
+}

@@ -1,0 +1,26 @@
+# Five-node variant: quorum of 3, tolerates 2 simultaneous failures.
+#
+# Used by the fault-injection scenarios that need to kill two nodes and still
+# have a working majority, and by the visualizer demo at 5 nodes. See
+# cluster.yaml for what each field means.
+
+cluster_id: quorum-local-5
+
+nodes:
+  - {id: 1, host: 127.0.0.1, grpc_port: 7001, http_port: 8001}
+  - {id: 2, host: 127.0.0.1, grpc_port: 7002, http_port: 8002}
+  - {id: 3, host: 127.0.0.1, grpc_port: 7003, http_port: 8003}
+  - {id: 4, host: 127.0.0.1, grpc_port: 7004, http_port: 8004}
+  - {id: 5, host: 127.0.0.1, grpc_port: 7005, http_port: 8005}
+
+raft:
+  tick_ms: 50
+  election_timeout_min_ticks: 10
+  election_timeout_max_ticks: 20
+  heartbeat_timeout_ticks: 3
+  snapshot_threshold_entries: 10000
+  max_entries_per_append: 256
+
+storage:
+  data_dir: ./data
+  wal_segment_bytes: 16777216

@@ -1,0 +1,197 @@
+// Client-facing key-value API, and the command format that goes into the log.
+//
+// The two are defined together because they are one contract. Deduplication
+// only works if the (client_id, seq) pair the client sends is the same pair the
+// state machine sees when the entry is applied, so the request message and the
+// log payload have to agree by construction rather than by convention.
+syntax = "proto3";
+
+package quorum.kv.v1;
+
+option go_package = "github.com/Shashankkaranamr/Quorum/gen/quorum/kv/v1;kvv1";
+
+// ---------------------------------------------------------------------------
+// Log payloads
+// ---------------------------------------------------------------------------
+
+// Command is the payload of an ENTRY_TYPE_NORMAL log entry.
+//
+// Every replica applies this deterministically. Nothing in applying a Command
+// may consult the clock, the network, or a random source, or replicas would
+// diverge while agreeing perfectly on the log.
+message Command {
+  // client_id is the log index of the client's ENTRY_TYPE_SESSION entry.
+  //
+  // Deriving the id from a log index rather than generating one makes it
+  // unique across the cluster with no coordination, no randomness and no
+  // collision risk, and it survives leader change because it was agreed by
+  // consensus like everything else.
+  uint64 client_id = 1;
+
+  // seq is the client's monotonic request number. A retry after an ambiguous
+  // failure reuses the same seq, which is exactly what lets the state machine
+  // recognize it as a duplicate and return the cached response instead of
+  // applying the write twice.
+  uint64 seq = 2;
+
+  oneof op {
+    PutOp put = 3;
+    DeleteOp delete = 4;
+  }
+}
+
+message PutOp {
+  string key = 1;
+  bytes value = 2;
+}
+
+message DeleteOp {
+  string key = 1;
+}
+
+// RegisterClientCommand is the payload of an ENTRY_TYPE_SESSION entry.
+//
+// It carries no client id: the id is the index this entry lands at. The nonce
+// exists only so a client can recognize its own registration in the applied
+// stream if it has to reconnect mid-registration.
+message RegisterClientCommand {
+  bytes nonce = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Service
+// ---------------------------------------------------------------------------
+
+// Status describes the outcome of a request, and in the failure cases, what
+// the client is allowed to do about it.
+//
+// The distinction that matters most is between NOT_LEADER (definitely not
+// applied: retry elsewhere) and LOST_LEADERSHIP (unknown whether applied:
+// retry with the same seq and let deduplication sort it out). Collapsing those
+// two into one error is how systems end up applying a write twice.
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+
+  STATUS_OK = 1;
+
+  // This node is not the leader and did not propose anything. Retry at
+  // leader_hint. Safe to retry with a new seq or the same one.
+  STATUS_NOT_LEADER = 2;
+
+  // The entry was proposed but leadership changed before it could be
+  // confirmed, so whether it committed is genuinely unknown. Retry with the
+  // SAME seq: if it did commit, the session cache returns the original
+  // response and duplicate is set.
+  STATUS_LOST_LEADERSHIP = 3;
+
+  // A read could not confirm leadership with a quorum, so serving it might
+  // have returned a stale value. Refusing is the correct answer here: a leader
+  // that has been silently partitioned must not answer from its own memory.
+  STATUS_NO_QUORUM = 4;
+
+  // The session was garbage collected. Exactly-once delivery can no longer be
+  // assured for this client, so it must register again. Reported rather than
+  // hidden, because it is the one case where the at-most-once guarantee
+  // legitimately lapses.
+  STATUS_SESSION_EXPIRED = 5;
+
+  STATUS_TIMEOUT = 6;
+}
+
+// LeaderHint tells a redirected client where to go, so a NOT_LEADER costs one
+// extra round trip rather than a full rediscovery sweep of the cluster.
+message LeaderHint {
+  uint64 node_id = 1;
+  string grpc_addr = 2;
+}
+
+message RegisterClientRequest {
+  bytes nonce = 1;
+}
+
+message RegisterClientResponse {
+  Status status = 1;
+  uint64 client_id = 2;
+  LeaderHint leader_hint = 3;
+}
+
+message PutRequest {
+  uint64 client_id = 1;
+  uint64 seq = 2;
+  string key = 3;
+  bytes value = 4;
+}
+
+message PutResponse {
+  Status status = 1;
+
+  // applied_index is the log index the write committed at. Exposed because a
+  // test that wants to prove a write survived a leader kill needs to name the
+  // write, and because the visualizer shows it.
+  uint64 applied_index = 2;
+
+  // duplicate is true when this response came from the session cache rather
+  // than a fresh apply, i.e. the client retried and deduplication caught it.
+  //
+  // This field is how the phase 5 test proves exactly-once actually happens
+  // instead of merely being claimed: kill the leader after commit but before
+  // the response, retry, and assert duplicate is true and the value was
+  // written once.
+  bool duplicate = 3;
+
+  LeaderHint leader_hint = 4;
+}
+
+message GetRequest {
+  string key = 1;
+
+  // client_id is carried for attribution in the visualizer and to keep the
+  // session alive. Reads are not logged and are idempotent, so they need no
+  // sequence number and are never deduplicated.
+  uint64 client_id = 2;
+}
+
+message GetResponse {
+  Status status = 1;
+  bool found = 2;
+  bytes value = 3;
+
+  // read_index is the log index this read was linearized at: the commit index
+  // the leader held when it began the ReadIndex round, after which it waited
+  // for the state machine to catch up to that point before answering.
+  //
+  // Exposing it makes the mechanism observable. A read that returns OK with a
+  // read_index behind a write the client was already told succeeded would be a
+  // linearizability violation, and a test can check exactly that.
+  uint64 read_index = 4;
+
+  LeaderHint leader_hint = 5;
+}
+
+message DeleteRequest {
+  uint64 client_id = 1;
+  uint64 seq = 2;
+  string key = 3;
+}
+
+message DeleteResponse {
+  Status status = 1;
+  uint64 applied_index = 2;
+  bool duplicate = 3;
+  bool existed = 4;
+  LeaderHint leader_hint = 5;
+}
+
+// KV is the client-facing API.
+//
+// Reads use ReadIndex, not a leader lease. A leader lease would be faster but
+// would trade correctness for an assumption about bounded clock drift, and
+// this project would rather be slow and honest than fast and conditionally
+// correct. The lease is documented in DESIGN.md as an optimization that is
+// deliberately off.
+service KV {
+  rpc RegisterClient(RegisterClientRequest) returns (RegisterClientResponse);
+  rpc Put(PutRequest) returns (PutResponse);
+  rpc Get(GetRequest) returns (GetResponse);
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+}
