@@ -16,12 +16,12 @@ a later phase is started before that.
 > we actually are** — what is built, what is verified, and what the next concrete
 > steps are. Check it before starting work.
 
-**Current status: phase 1 complete.**
+**Current status: phase 2 complete.**
 
 | Phase | Title | Status |
 |---|---|---|
 | 1 | Foundations and design | ✅ complete |
-| 2 | Core consensus: election and log replication | not started |
+| 2 | Core consensus: election and log replication | ✅ complete |
 | 3 | Crash-safe persistence | not started |
 | 4 | Snapshotting and log compaction | not started |
 | 5 | gRPC KV service, linearizable reads, deduplication | not started |
@@ -64,42 +64,61 @@ the log entry format and the KV contract.
 
 ---
 
-## Phase 2 — Core consensus: election and log replication
+## Phase 2 — Core consensus: election and log replication ✅
 
 **Goal.** A correct Raft state machine, in memory, with a deterministic
 simulator and invariant checkers that have been proven capable of failing.
 
-**Deliverables.** `raft/` (node, log, election, replication, Ready);
+**Delivered.** `raft/` (types, config, log, node, election, replication);
 `internal/transport/` interface and `inmem/`; `internal/testutil/` harness,
-invariant checkers and mutation fixtures; `internal/pbconv/`.
+checkers and mutation fixtures; `internal/pbconv/`. Plus two additions to the
+original scope, both consistent with DESIGN.md and recorded in §10 there:
+`internal/storage` (interface + `MemStorage`) and `internal/server` (the shared
+Ready-processing function and the `tick_lag` metrics), which phase 3 needs
+anyway and which make the durability ordering testable from the fast suite.
 
 **Acceptance criteria**
 
-1. **Purity holds.** `TestRaftCoreImportAllowlist` still passes with the full
-   algorithm implemented: no `time`, `sync`, `os`, `net`, `context` or
-   `math/rand` in package `raft`. Election jitter comes from an injected seed.
-2. **Elections converge.** For cluster sizes 3 and 5, over **1000 seeds**, a
-   cold-start cluster elects exactly one leader within
-   `10 × election_timeout_max` ticks. `TestElectionConverges` reports the seed
-   of any run that does not.
-3. **All five safety invariants are checked after every simulated step**, not
-   just at the end of a scenario: `TestElectionSafety`, `TestLeaderAppendOnly`,
-   `TestLogMatching`, `TestLeaderCompleteness`, `TestStateMachineSafety`.
-4. **The checkers have teeth.** `TestMutatedRaftTripsInvariant/*` runs
-   deliberately broken Raft variants — a node that votes twice in a term, a
-   leader that truncates its own log, a commit rule that counts itself twice —
-   and **fails if the corresponding checker does not catch them**. A checker
-   that cannot fail is not evidence.
-5. **Replication works.** `TestProposalsCommitAndApply`: entries proposed on the
-   leader are committed and applied in identical order on every live node.
-6. **Leader failure is survivable.** `TestLeaderFailoverPreservesCommitted`:
-   kill the leader mid-scenario; a new leader is elected and every entry that
-   was committed before the kill is present in the new leader's log.
-7. **A minority cannot commit.** `TestMinorityPartitionCannotCommit`: partition
-   2 of 5 nodes; proposals on the minority side never reach `applied` on any
-   node; the majority side continues committing.
-8. `make race` is clean. `go.uber.org/goleak` reports no leaked goroutines in
-   driver tests.
+1. ✅ **Purity holds.** `TestRaftCoreImportAllowlist` passes with the full
+   algorithm implemented, and now also asserts it is scanning the real files
+   rather than a stub. `TestRaftCoreHasNoConcurrencyPrimitives` additionally
+   rejects `go`, `select` and channel types, which no import check can see.
+2. ✅ **Elections converge.** `TestElectionConverges`: 1000 seeds at n=3 and
+   n=5. Worst observed 38 ticks (n=3) and 25 ticks (n=5) against a bound of
+   200. The test reports the worst case so the margin is measured, not assumed.
+3. ✅ **All five safety invariants are checked after every simulated step**, by
+   `testutil.Checker`, plus `CommittedEntriesAreStable` and `WellFormed`.
+   `TestRandomizedTrialsUpholdSafety` runs 200 trials per cluster size with
+   randomized loss, delay, duplication, reordering, partitions and crashes.
+4. ✅ **The checkers have teeth**, in two layers:
+   `TestMutatedRaftTripsInvariant` breaks one Raft rule at a time and requires
+   the matching checker to fire; `TestCheckerDetectsHandBuiltViolations` feeds
+   each checker a synthetic violating history, covering the ones no single
+   mutation reaches. Every checker has now been observed to fail for the right
+   reason, and to accept a healthy history.
+5. ✅ **Replication works.** `TestProposalsCommitAndApply` asserts identical
+   apply ORDER, not merely identical contents.
+6. ✅ **Leader failure is survivable.** `TestLeaderFailoverPreservesCommitted`.
+7. ✅ **A minority cannot commit.** `TestMinorityPartitionCannotCommit` strands
+   the OLD LEADER in the minority, which is the case that actually proves
+   something, then heals and requires full reconvergence — including an
+   assertion that the minority was genuinely behind first, so the test cannot
+   pass vacuously.
+8. ✅ `make race` is clean (59s). ⬜ **goleak is deferred to phase 3.** It is
+   vacuous here: this phase has no goroutines at all, by design. It becomes
+   meaningful when the real driver goroutine exists.
+
+**Also delivered beyond the original criteria**
+
+- `TestFigure8CommitRule` constructs the Figure 8 scenario exactly and asserts
+  both that the correct rule refuses to commit an old-term entry on a majority,
+  and that removing the rule loses a committed entry.
+- `TestLivenessBoundUnderTransientFaults`: a leader within 150 ticks on a lossy
+  but unpartitioned network; worst observed 51 ticks.
+- `TestTickLagIsMeasured`: the `tick_lag` instrumentation phase 6 depends on,
+  exercised against storage configured to cost logical ticks per fsync.
+- `TestFailureMessagesAreLazy`: a regression guard for a real bug found this
+  phase (BUGS.md, 2026-09-23).
 
 ---
 

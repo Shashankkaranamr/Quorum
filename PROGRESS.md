@@ -13,18 +13,19 @@ updated at the end of every phase.
 
 | | |
 |---|---|
-| **Current phase** | **1 of 8 — complete** |
-| **Next phase** | 2 — core consensus: election and log replication |
+| **Current phase** | **2 of 8 — complete** |
+| **Next phase** | 3 — crash-safe persistence |
 | **Last updated** | 2026-09-23 |
-| **HEAD** | `2376659` — *Phase 1: design decisions and repository scaffold* |
 | **Branch** | `main`, pushed to `github.com/Shashankkaranamr/Quorum` |
-| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race |
-| **Tests** | 14 test functions, 23 cases, all passing |
+| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test (11s), race (59s) |
+| **Tests** | 45 test functions across 5 packages, all passing |
 | **Go** | 1.27.0 |
 
-> **No consensus logic exists yet.** Phase 1 delivered decisions, a scaffold,
-> and the tests that keep the later phases honest. Every package under
-> `internal/` except `config` is a documented stub.
+> **Raft elects and replicates, in memory.** The consensus core is complete and
+> its five safety properties are checked after every simulated tick across 400
+> randomized trials. There is still no real disk, no real network and no gRPC:
+> `MemStorage` and the in-memory bus satisfy the interfaces that phases 3 and 5
+> will put real implementations behind.
 
 ---
 
@@ -33,8 +34,8 @@ updated at the end of every phase.
 | Phase | Title | Status |
 |---|---|---|
 | 1 | Foundations and design | ✅ **complete** |
-| 2 | Core consensus: election and log replication | ⬜ next |
-| 3 | Crash-safe persistence | ⬜ not started |
+| 2 | Core consensus: election and log replication | ✅ **complete** |
+| 3 | Crash-safe persistence | ⬜ next |
 | 4 | Snapshotting and log compaction | ⬜ not started |
 | 5 | gRPC KV service, linearizable reads, deduplication | ⬜ not started |
 | 6 | Fault-injection suite and bug log | ⬜ not started |
@@ -48,73 +49,89 @@ when all of them pass and `make ci` is green.
 
 ## What exists right now
 
-### Real, working code
+### Complete
 
 | Path | State |
 |---|---|
-| `internal/config/` | **Complete.** Loads and strictly validates `cluster.yaml`. Rejects unknown fields, duplicate ids/ports, and timing that is well-formed but wrong (empty election-timeout range, election timeout under 3× heartbeat, cluster smaller than 3). Warns on even cluster sizes. |
-| `cmd/quorum-node/` | **Minimal but real.** Parses flags and config, prints its identity, peers, data dir, quorum and timing, exits 0. No server, no consensus. |
-| `cmd/quorumctl/` | **Minimal but real.** `plan` and `version` work. Every other subcommand is recognized, documented in `--help` with its phase, and **exits non-zero** — a stub exiting 0 would let a broken script look green. |
-| `cmd/quorum-viz/` | Stub. Exits 2 pointing at phase 7. |
-| `proto/quorum/{raft,kv,admin}/v1/` | **Schemas complete.** Log entry format, WAL record types, Raft messages, KV contract, admin/fault-injection API. `buf lint` clean. |
-| `gen/` | Generated Go from the above, **checked in** so a clean clone builds with only Go. |
-| Build tooling | `Makefile` + `make.ps1` mirror, `.golangci.yml`, `buf.yaml`, `buf.gen.yaml`. |
+| `raft/` | **The consensus core.** Leader election with randomized timeouts, log replication with prevLog consistency checks and conflict-term backoff, the Figure 8 commit rule, and the Step/Ready protocol. No I/O, no clock, no goroutines, no locks - enforced by `purity_test.go`. |
+| `internal/transport/` | `Transport` interface (Send only - see DESIGN.md §10) and `inmem/`, a deterministic bus with drops, delays, duplication, reordering and directed (one-way capable) partitions, all seeded. |
+| `internal/storage/` | `Storage` interface and `MemStorage`. Buffers on Append/SetHardState and publishes only on Sync, so a crash loses exactly what a real node would. Can be configured to cost logical ticks per fsync. |
+| `internal/server/` | The driver: the one place Ready ordering is decided, plus the `tick_lag` and fsync metrics. Shared by the simulator and, from phase 3, the real goroutine loop. |
+| `internal/testutil/` | The simulated cluster and the invariant checkers - the primary deliverable of phase 2. |
+| `internal/pbconv/` | Core types to protobuf and back, so `raft/` never imports the protobuf runtime. |
+| `internal/config/` | Loads and strictly validates `cluster.yaml`. |
+| `proto/`, `gen/` | Schemas and checked-in generated code. `buf lint` clean. |
+| `cmd/quorum-node`, `cmd/quorumctl` | Minimal but real: parse config, print what they would do, exit 0. Unimplemented subcommands exit non-zero naming their phase. |
 
 ### Documented stubs (a `doc.go` each, no logic)
 
-`raft/` · `internal/server/` · `internal/storage/` · `internal/statemachine/` ·
-`internal/transport/` + `inmem/` + `grpcx/` · `internal/pbconv/` ·
-`internal/kvservice/` · `internal/admin/` · `internal/client/` ·
-`internal/supervisor/` · `internal/testutil/`
+`internal/statemachine/` (phase 5) - `internal/transport/grpcx/` (phase 5) -
+`internal/kvservice/` (phase 5) - `internal/admin/` (phase 6/7) -
+`internal/client/` (phase 5) - `internal/supervisor/` (phase 6) -
+`cmd/quorum-viz/` (phase 7)
 
 Each `doc.go` states the package's responsibility, the invariants it must
 uphold, and the phase that fills it in. **Read the `doc.go` before implementing
-a package** — it is the spec.
-
-### Empty, reserved for later phases
-
-`test/integration/` (phase 6) · `web/` (phase 7) · `docs/` (phase 8)
+a package** - it is the spec.
 
 ---
 
 ## What is actually verified
 
-23 passing cases across 14 test functions. What each group proves:
+45 test functions across 5 packages. What each group proves:
 
-**The consensus core performs no I/O** — `raft/purity_test.go`
+**The consensus core stays pure** - `raft/purity_test.go`
 
-- `TestRaftCoreImportAllowlist` — direct imports of `raft/` checked against an
-  allowlist that excludes `time`, `sync`, `os`, `net`, `context`, `math/rand`.
-- `TestRaftCoreDoesNotWriteToStdout` — AST walk rejecting `fmt.Print*`,
-  `fmt.Fprint*` and the `print`/`println` builtins (closes the gap left by
-  allowing `fmt` for `Errorf`).
-- `TestRaftCoreIsTheOnlyExportedPackage` — keeps the structural shortcut that
-  makes the purity claim checkable by reading one import list.
-- `TestImportAllowlistCheckerDetectsViolations` — **negative control.**
+- Import allowlist, now also asserting it is scanning the real implementation
+  files rather than passing vacuously against a stub.
+- `TestRaftCoreHasNoConcurrencyPrimitives` rejects `go`, `select` and channel
+  types, which no import check can see.
+- No `fmt.Print*`; `raft` is the only exported package.
+- Negative control: the checker is run against a deliberately impure fixture.
 
-**Configuration is validated strictly** — `internal/config/config_test.go`
+**Raft's safety properties hold under adversity** - `internal/testutil/`
 
-- 9 rejection cases, each naming the mistake it guards against.
-- Defaults, accessors, quorum arithmetic, even-size warnings, and a check that
-  the committed `cluster.yaml` is itself valid (so the documented quickstart
-  cannot silently break).
+- `TestRandomizedTrialsUpholdSafety`: 200 trials per cluster size (3 and 5),
+  each 500 ticks with randomized loss, delay, duplication, reordering,
+  partitions and crashes, then healed and run to convergence. All seven
+  invariants checked **after every tick**. The suite asserts it actually
+  injected faults and actually committed entries, so a trial that did nothing
+  cannot count as evidence. Last run: 39k committed entries, 92k dropped
+  messages, 93k blocked by partitions, zero violations.
+- `TestElectionConverges`: 1000 seeds per size. Worst 38 ticks (n=3), 25 (n=5).
+- `TestLivenessBoundUnderTransientFaults`: 10% drops, delays to 3 ticks; worst
+  51 ticks against a bound of 150.
+- `TestMinorityPartitionCannotCommit`, `TestLeaderFailoverPreservesCommitted`,
+  `TestProposalsCommitAndApply`, `TestTickLagIsMeasured`.
 
-**The two task runners cannot drift** — `test/tooling/targets_test.go`
+**The fiddly Figure 2 mechanics** - `raft/node_test.go`, `raft/figure8_test.go`
 
-- Target names and descriptions must match between `Makefile` and `make.ps1`.
-- Every advertised PowerShell target must have a `switch` arm (otherwise it
-  would no-op and exit 0).
-- Docs cannot reference a `make` target that does not exist.
+- `TestUpToDateComparison` - the §5.4.1 term-then-index comparison, including
+  the case that fails if it is written backwards.
+- `TestElectionTimerResetDiscipline` - resets on exactly two events, and
+  explicitly does NOT reset on a refused vote or on any response.
+- `TestStaleAppendEntriesDoesNotTruncate` - reordered and duplicated messages.
+- `TestFigure8CommitRule` - the constructed Figure 8 scenario.
 
-### Checkers confirmed capable of failing
+**The wire and disk format round-trips** - `internal/pbconv/pbconv_test.go`
 
-Per [CLAUDE.md §3.4](CLAUDE.md), a checker nobody has seen fail is not evidence.
-Both were deliberately broken and observed to fail:
+### Every checker has been observed to fail for the right reason
 
-| Checker | Injected fault | Result |
-|---|---|---|
-| Import allowlist | added `import "time"` to package `raft` | `FAIL: package raft imports [time], which is not on the allowlist` |
-| Task-runner parity | deleted the `cover` target from `make.ps1` only | `FAIL: Makefile and make.ps1 expose different targets` |
+Per [CLAUDE.md](CLAUDE.md), a checker nobody has seen fail is not evidence.
+Two layers:
+
+| Checker | How it was shown to fail |
+|---|---|
+| ElectionSafety | `MutationVoteTwicePerTerm` produced *two leaders in term 2: node 5 and node 3* |
+| LeaderCompleteness | `MutationSkipUpToDateCheck` produced *node 5 became leader in term 4 without entry 111* |
+| LeaderAppendOnly | `MutationLeaderTruncatesOwnLog` produced *leader 4 log shrank from 114 to 113 entries* |
+| CommittedEntriesAreStable | `MutationCommitAnyTerm` via `TestFigure8CommitRule` |
+| LogMatching, StateMachineSafety, WellFormed | hand-built violating histories (`TestCheckerDetectsHandBuiltViolations`) |
+| Import allowlist | `import "time"` added to package `raft` |
+| Task-runner parity | a target deleted from `make.ps1` only |
+
+`TestCheckerAcceptsAHealthyHistory` is the other half: a checker that fires on
+everything is as useless as one that fires on nothing.
 
 ---
 
@@ -152,47 +169,47 @@ form, so nothing gets re-litigated by accident:
 
 ## Open items
 
-Nothing is blocking phase 2. Carried forward for later:
+Nothing is blocking phase 3. Carried forward:
 
-- **The claim-to-test traceability table** in
-  [DESIGN.md §7](DESIGN.md#7-claim-to-test-traceability) has 3 of 22 rows filled.
-  Each later phase fills its own rows; phase 6 requires it complete.
-- **BUGS.md has no real entries yet** — by design. It starts collecting in
-  phase 6. The predicted-but-not-yet-observed locking bug is recorded in its
-  "not yet borne out" section rather than invented.
-- **No CI runner is configured.** `make ci` exists and passes locally; wiring it
-  to GitHub Actions is unscheduled and optional for a local-only project.
-- **`internal/pbconv` is not in the original plan's layout** — it was added so
-  that package `raft` can avoid depending on the protobuf runtime, which is what
-  keeps the purity claim mechanically checkable.
+- **goleak is deferred from phase 2 to phase 3.** Vacuous while there are no
+  goroutines; meaningful once the real driver loop exists.
+- **`Mutation` ships in production code** so the negative controls can reach it
+  from another package. Fenced by `TestZeroConfigIsUnmutated` and
+  `TestEveryMutationIsDistinct`; reasoning in DESIGN.md §10.
+- **`InstallSnapshot` message types exist but are rejected.** The message space
+  is fixed; phase 4 implements them.
+- **The claim-to-test traceability table** (DESIGN.md §7) now has 21 rows
+  filled. Phase 6 requires it complete.
+- **No CI runner is configured.** `make ci` passes locally: test 11s, race 59s.
 
 ---
 
-## Next: phase 2
+## Next: phase 3
 
-**Goal.** A correct Raft state machine, in memory, with a deterministic
-simulator and invariant checkers proven capable of failing.
+**Goal.** A node that restarts never loses or contradicts what it already agreed
+to, and the fsync boundary is auditable.
 
-Full acceptance criteria: [PLAN.md § Phase 2](PLAN.md#phase-2--core-consensus-election-and-log-replication).
+Full acceptance criteria: [PLAN.md](PLAN.md).
 
-Suggested order of attack:
+Phase 2 left the ground prepared, so this is narrower than it looks:
 
-1. `raft/` types and log (`Entry`, `Message`, `HardState`, `Ready`, `Config`
-   with the injected rand source) — obeying the import allowlist from the first
-   line.
-2. `internal/pbconv/` — conversion to and from the generated protobuf types.
-3. `internal/transport/` interface, then `inmem/` with its partition matrix and
-   logical-tick delay queue.
-4. `internal/testutil/` harness — step every node, deliver due messages, and
-   assert all five safety invariants **after every step**.
-5. Election, then replication, in `raft/`.
-6. The mutation fixtures (`TestMutatedRaftTripsInvariant/*`) — do not skip
-   these; they are what makes the invariant checkers count as evidence.
+1. The `Storage` interface already exists and `MemStorage` already models the
+   buffer/Sync split, including losing unsynced writes on a crash. The real WAL
+   goes behind the same interface; `internal/testutil` should not need to
+   change.
+2. `Driver.ProcessReady` already enforces Append, SetHardState, Sync, Send,
+   Apply in that order and counts syncs. `TestNoSendBeforeSync` and
+   `TestOneFsyncPerReady` become assertions against a recording test double
+   rather than new plumbing.
+3. `raft.New` already takes restored `HardState`, `Entries` and `Applied`, and
+   `Cluster.Restart` already exercises that path against durable-only state.
+4. The record framing is already specified in `proto/quorum/raft/v1/raft.proto`
+   (`WalEntryBatch`, `WalSnapshotPointer`) and `internal/pbconv` already
+   round-trips the types.
 
-Watch for: the temptation to reach for `time.Now()` or a mutex inside `raft/`
-(the purity test will stop you, but the design is what should stop you first),
-and the temptation to assert invariants only at the end of a scenario rather
-than after every step.
+Watch for: `MemStorage.SetApplied` is currently never called, so a restarted
+node replays its whole log - fine now, but phase 4 needs it. And the torn-tail
+test is the one that matters: truncate at **every** byte offset, not a sample.
 
 ---
 
@@ -215,3 +232,22 @@ broken; both binaries produce correct output against `cluster.yaml` and
 
 Committed as `2376659`, authored solely by the repository owner with no AI
 attribution trailers, pushed to `main`.
+
+### Phase 2 - 2026-09-23
+
+Implemented the Raft core (election, replication, Figure 8 commit rule), the
+deterministic simulator, the invariant checkers, the driver with its Ready
+ordering and tick-lag metrics, and the protobuf conversion layer.
+
+Two interface changes from the phase 1 design, both recorded in DESIGN.md §10:
+`Transport` lost `Recv` (a channel needs a goroutine, which the simulator must
+not have), and the leader counts itself in the commit quorum only up to its
+durable index rather than its last index.
+
+Found and fixed two real bugs, both in the tests rather than the consensus code,
+both recorded in BUGS.md: failure-message arguments evaluated on every passing
+assertion (5x slowdown, found by profiling after two rounds of guessing), and a
+reconvergence assertion that could have passed without anything reconverging.
+
+No Raft safety violation was found. Recorded in BUGS.md as a note rather than
+left implied, since "our tests found no bugs" is the honest claim.

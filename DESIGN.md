@@ -9,8 +9,10 @@ that would fail if the claim were untrue, or says which phase adds that test.
 Where it claims less than the reader might assume, it says so explicitly —
 see [§6, What this will and will not guarantee](#6-what-this-will-and-will-not-guarantee).
 
-**Status:** phase 1 of 8. Sections 1–6 are decided. The code that implements
-them lands in phases 2–8; see [PLAN.md](PLAN.md).
+**Status:** phase 2 of 8 complete. Sections 1–6 are decided. Where the
+implementation has since diverged from them, §10 records what changed and why;
+see [PLAN.md](PLAN.md) for the roadmap and [PROGRESS.md](PROGRESS.md) for where
+the work actually is.
 
 ---
 
@@ -25,6 +27,7 @@ them lands in phases 2–8; see [PLAN.md](PLAN.md).
 7. [Claim-to-test traceability](#7-claim-to-test-traceability)
 8. [Repository layout](#8-repository-layout)
 9. [Deliberate deferrals](#9-deliberate-deferrals)
+10. [Implementation deltas](#10-implementation-deltas)
 
 ---
 
@@ -99,7 +102,7 @@ this project is trying to demonstrate.
 | Config | `go.yaml.in/yaml/v3` (the maintained successor to the archived `gopkg.in/yaml.v3`) |
 | Tests | stdlib `testing` + `github.com/stretchr/testify/require` |
 | Linearizability checking | `github.com/anishathalye/porcupine` (phase 5) |
-| Goroutine-leak detection | `go.uber.org/goleak` (phase 2) |
+| Goroutine-leak detection | `go.uber.org/goleak` (phase 3; vacuous earlier, see §10) |
 | Lint | `golangci-lint` + `go vet` |
 
 Generated protobuf code is **checked in**, so cloning and running `make test`
@@ -608,12 +611,24 @@ be complete, and phase 8 requires it to appear in the README.
 | The consensus core performs no I/O | `TestRaftCoreImportAllowlist`, `TestRaftCoreDoesNotWriteToStdout` | ✅ 1 |
 | That purity check can actually fail | `TestImportAllowlistCheckerDetectsViolations` | ✅ 1 |
 | A misconfigured cluster is rejected at startup | `TestLoadRejectsBadConfigs` | ✅ 1 |
-| Exactly one leader per term | `TestElectionSafety` (invariant, every step) | 2 |
-| Log Matching holds | `TestLogMatching` (invariant, every step) | 2 |
-| Leader Completeness holds | `TestLeaderCompleteness` (invariant, every step) | 2 |
-| State Machine Safety holds | `TestStateMachineSafety` (invariant, every step) | 2 |
-| The invariant checkers can fail | `TestMutatedRaftTripsInvariant/*` | 2 |
-| A minority partition cannot commit | `TestMinorityPartitionCannotCommit` | 2 |
+| The core performs no concurrency either | `TestRaftCoreHasNoConcurrencyPrimitives` | ✅ 2 |
+| Exactly one leader per term | `ElectionSafety` checker, asserted every tick by `TestRandomizedTrialsUpholdSafety` | ✅ 2 |
+| Leader Append-Only holds | `LeaderAppendOnly` checker, every tick | ✅ 2 |
+| Log Matching holds | `LogMatching` checker, every tick | ✅ 2 |
+| Leader Completeness holds | `LeaderCompleteness` checker, on every election | ✅ 2 |
+| State Machine Safety holds | `StateMachineSafety` checker, on every apply | ✅ 2 |
+| A committed entry is never altered | `CommittedEntriesAreStable` checker, every tick | ✅ 2 |
+| Every checker can actually fail | `TestMutatedRaftTripsInvariant/*` and `TestCheckerDetectsHandBuiltViolations/*` | ✅ 2 |
+| The checkers accept a healthy history | `TestCheckerAcceptsAHealthyHistory` | ✅ 2 |
+| An old-term entry is not committed by replica count (Figure 8) | `TestFigure8CommitRule` | ✅ 2 |
+| The §5.4.1 up-to-date comparison is the right way round | `TestUpToDateComparison` | ✅ 2 |
+| The election timer resets only on a granted vote or a leader's AppendEntries | `TestElectionTimerResetDiscipline` | ✅ 2 |
+| A stale or duplicated AppendEntries never truncates the log | `TestStaleAppendEntriesDoesNotTruncate` | ✅ 2 |
+| Elections converge within the bound | `TestElectionConverges` (1000 seeds), `TestLivenessBoundUnderTransientFaults` | ✅ 2 |
+| A minority partition cannot commit | `TestMinorityPartitionCannotCommit` | ✅ 2 |
+| Committed entries survive a leader kill | `TestLeaderFailoverPreservesCommitted` | ✅ 2 |
+| Tick lag is measurable | `TestTickLagIsMeasured` | ✅ 2 |
+| Wire and disk encoding round-trip | `TestMessageRoundTrip`, `TestEntryTypeValuesMatch` | ✅ 2 |
 | Nothing is sent before it is durable | `TestNoSendBeforeSync` | 3 |
 | Exactly one fsync per Ready batch | `TestOneFsyncPerReady` | 3 |
 | Recovery from a torn WAL yields a prefix | `TestWALTruncationAtEveryOffset` | 3 |
@@ -684,3 +699,54 @@ Things considered and consciously left out, so that "we didn't think of it" and
 | TLS / peer authentication | Localhost only, no Byzantine model | Medium |
 | Kernel-level partitions | Needs elevation, not portable | Medium — a second fault-injection backend |
 | Multi-key transactions | Out of scope for a KV store demonstrating consensus | High |
+
+---
+
+## 10. Implementation deltas
+
+Where the code diverged from this document, and why. Recorded as it happens
+rather than reconciled at the end, so that "we changed our mind" and "we forgot"
+stay distinguishable. Phase 8 consolidates this into the body of the document.
+
+### Phase 2
+
+**`Transport` lost its `Recv` method.** §3 originally sketched
+`Recv() <-chan Message` alongside `Send`. A channel needs a goroutine to feed
+it, and the deterministic simulator is deliberately single-threaded so that a
+trial replays exactly from its seed. Rather than give the simulator a goroutine,
+the interface narrowed to `Send` alone and inbound delivery became the driver's
+concern: the simulator's scheduler pushes straight into `Node.Step`, and phase
+5's gRPC transport will expose its own channel for the real driver to select on.
+Both still run identical consensus code, which was the point. The reasoning is
+repeated at the interface itself in `internal/transport/transport.go`.
+
+**The leader counts itself only up to its durable index.** A leader is part of
+its own commit quorum. Counting entries it had merely appended in memory would
+leave a window where a crash after commit but before fsync loses an entry the
+cluster believed committed — the quorum would have been one short all along. So
+`matchIndex[self]` tracks the stable (fsynced) index, not the last index, and
+advances in `Advance()` rather than at append time. This costs one Ready cycle
+of commit latency and is a deliberate divergence from etcd, which historically
+counted at append time. See `Node.updateSelfProgress`.
+
+**`internal/storage` and `internal/server` arrived in phase 2, not phase 3.**
+PLAN.md scheduled storage for phase 3. Phase 2 needs a `Storage` implementation
+for the simulator anyway, and putting the shared Ready-processing function in
+place now is what makes the fsync-before-send ordering testable from the fast
+suite rather than only end-to-end. Phase 3 replaces `MemStorage` with the real
+write-ahead log behind the same interface; nothing else moves.
+
+**`raft.Mutation` ships in production code.** The invariant checkers are the
+primary deliverable of phase 2, and the only way to show a checker works is to
+run it against a Raft that is genuinely broken. The checkers live in
+`internal/testutil`, a different package, so the knob has to be reachable from
+`raft.Config`. It is fenced: the zero value is correct Raft
+(`TestZeroConfigIsUnmutated`), every value names the exact rule it removes, and
+each is surgical enough that a reported violation names the rule that was
+broken. The alternative — a build tag — would have kept it out of normal builds
+at the cost of the negative controls not running in `make test`, which defeats
+the purpose.
+
+**goleak is deferred from phase 2 to phase 3.** PLAN.md listed it under phase 2.
+This phase has no goroutines at all by design, so the check is vacuous. It
+becomes meaningful when the real driver goroutine exists.

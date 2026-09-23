@@ -81,6 +81,17 @@ func disallowedImports(t *testing.T, dir string) []string {
 // reach the clock, the disk or the network on its own, and this is what stops
 // that from quietly stopping being true.
 func TestRaftCoreImportAllowlist(t *testing.T) {
+	// Guard against the check passing because there is nothing to check. A
+	// stub package imports nothing and would satisfy any allowlist, so the
+	// test confirms it is scanning the real algorithm before trusting the
+	// result.
+	pkg, err := build.ImportDir(".", 0)
+	require.NoError(t, err)
+	for _, want := range []string{"node.go", "log.go", "election.go", "replication.go", "config.go", "types.go"} {
+		require.Containsf(t, pkg.GoFiles, want,
+			"purity_test is not scanning %s; the allowlist would pass vacuously", want)
+	}
+
 	bad := disallowedImports(t, ".")
 	require.Emptyf(t, bad, ""+
 		"package raft imports %v, which is not on the allowlist in purity_test.go.\n"+
@@ -102,6 +113,39 @@ func TestImportAllowlistCheckerDetectsViolations(t *testing.T) {
 		"the allowlist checker reported no violations for %s, which imports net, os and time. "+
 			"The checker is broken, so TestRaftCoreImportAllowlist proves nothing.", fixture)
 	require.Subset(t, bad, []string{"net", "os", "time"})
+}
+
+// TestRaftCoreHasNoConcurrencyPrimitives is a source-level companion to the
+// import allowlist.
+//
+// The allowlist already excludes sync, but a goroutine or a channel needs no
+// import at all -- `go f()` and `chan T` are language constructs. The core is
+// single-owner by contract, and a stray goroutine would silently break that
+// without tripping any import check.
+func TestRaftCoreHasNoConcurrencyPrimitives(t *testing.T) {
+	pkg, err := build.ImportDir(".", 0)
+	require.NoError(t, err)
+
+	fset := token.NewFileSet()
+	for _, name := range pkg.GoFiles {
+		file, err := parser.ParseFile(fset, name, nil, 0)
+		require.NoErrorf(t, err, "parsing %s", name)
+
+		ast.Inspect(file, func(n ast.Node) bool {
+			switch node := n.(type) {
+			case *ast.GoStmt:
+				t.Errorf("%s: `go` statement in the consensus core; a single owner "+
+					"serializes every call and that ownership is what replaces locking",
+					fset.Position(node.Pos()))
+			case *ast.SelectStmt:
+				t.Errorf("%s: `select` in the consensus core; blocking belongs in the driver",
+					fset.Position(node.Pos()))
+			case *ast.ChanType:
+				t.Errorf("%s: channel type in the consensus core", fset.Position(node.Pos()))
+			}
+			return true
+		})
+	}
 }
 
 // TestRaftCoreDoesNotWriteToStdout closes the gap left by allowing fmt.
