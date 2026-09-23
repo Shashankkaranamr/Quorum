@@ -12,6 +12,10 @@ fails if two leaders ever hold the same term" is.
 A phase is done when every criterion passes and `make ci` is green. Nothing from
 a later phase is started before that.
 
+> **This file defines the destination. [PROGRESS.md](PROGRESS.md) records where
+> we actually are** — what is built, what is verified, and what the next concrete
+> steps are. Check it before starting work.
+
 **Current status: phase 1 complete.**
 
 | Phase | Title | Status |

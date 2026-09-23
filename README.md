@@ -179,9 +179,11 @@ proto/           schemas for the log format, KV contract and admin API
 
 | | |
 |---|---|
+| [PROGRESS.md](PROGRESS.md) | Current state: what is built, what is verified, what is next |
 | [DESIGN.md](DESIGN.md) | The five design decisions and why, the guarantees, and the claim-to-test table |
 | [PLAN.md](PLAN.md) | The 8-phase roadmap with acceptance criteria per phase |
 | [BUGS.md](BUGS.md) | Bugs testing actually found, with the regression test guarding each |
+| [CLAUDE.md](CLAUDE.md) | Working rules and invariants for anyone (or any agent) contributing |
 
 ## License
 

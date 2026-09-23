@@ -151,7 +151,7 @@ func TestDocumentedCommandsExist(t *testing.T) {
 	targets := makefileTargets(t)
 
 	var found int
-	for _, doc := range []string{"README.md", "DESIGN.md", "PLAN.md"} {
+	for _, doc := range []string{"README.md", "DESIGN.md", "PLAN.md", "PROGRESS.md", "CLAUDE.md"} {
 		for _, snippet := range codeSnippets(readRepoFile(t, doc)) {
 			for _, m := range buildCmdRE.FindAllStringSubmatch(snippet, -1) {
 				found++
