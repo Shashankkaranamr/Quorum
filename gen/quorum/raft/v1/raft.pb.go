@@ -862,11 +862,21 @@ func (x *InstallSnapshotResponse) GetBytesReceived() uint64 {
 	return 0
 }
 
-// WalEntryBatch is one Ready batch worth of appended entries. The batch is the
-// unit of atomicity: one batch, one fsync.
+// WalEntryBatch is everything one Ready batch makes durable: its entries and,
+// if it changed, the hard state. The batch is the unit of atomicity: one batch,
+// one record, one fsync.
+//
+// hard_state lives inside the batch rather than in a record of its own so that
+// a torn write can only lose a whole batch. With two records per batch, a crash
+// between them would recover entries without the hard state written alongside
+// them -- harmless only by an argument about what the core can emit in one
+// Ready, and that argument should not have to be re-checked every time the core
+// changes. One CRC over both makes it unconditional.
 type WalEntryBatch struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Entries       []*Entry               `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Entries []*Entry               `protobuf:"bytes,1,rep,name=entries,proto3" json:"entries,omitempty"`
+	// Absent when the batch did not change term, vote or commit.
+	HardState     *HardState `protobuf:"bytes,2,opt,name=hard_state,json=hardState,proto3" json:"hard_state,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -904,6 +914,13 @@ func (*WalEntryBatch) Descriptor() ([]byte, []int) {
 func (x *WalEntryBatch) GetEntries() []*Entry {
 	if x != nil {
 		return x.Entries
+	}
+	return nil
+}
+
+func (x *WalEntryBatch) GetHardState() *HardState {
+	if x != nil {
+		return x.HardState
 	}
 	return nil
 }
@@ -1079,9 +1096,11 @@ const file_quorum_raft_v1_raft_proto_rawDesc = "" +
 	"\x04data\x18\x03 \x01(\fR\x04data\x12\x12\n" +
 	"\x04done\x18\x04 \x01(\bR\x04done\"@\n" +
 	"\x17InstallSnapshotResponse\x12%\n" +
-	"\x0ebytes_received\x18\x01 \x01(\x04R\rbytesReceived\"@\n" +
+	"\x0ebytes_received\x18\x01 \x01(\x04R\rbytesReceived\"z\n" +
 	"\rWalEntryBatch\x12/\n" +
-	"\aentries\x18\x01 \x03(\v2\x15.quorum.raft.v1.EntryR\aentries\"\xa5\x01\n" +
+	"\aentries\x18\x01 \x03(\v2\x15.quorum.raft.v1.EntryR\aentries\x128\n" +
+	"\n" +
+	"hard_state\x18\x02 \x01(\v2\x19.quorum.raft.v1.HardStateR\thardState\"\xa5\x01\n" +
 	"\x12WalSnapshotPointer\x12<\n" +
 	"\bmetadata\x18\x01 \x01(\v2 .quorum.raft.v1.SnapshotMetadataR\bmetadata\x12\x1a\n" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x16\n" +
@@ -1140,14 +1159,15 @@ var file_quorum_raft_v1_raft_proto_depIdxs = []int32{
 	1,  // 7: quorum.raft.v1.AppendEntries.entries:type_name -> quorum.raft.v1.Entry
 	3,  // 8: quorum.raft.v1.InstallSnapshot.metadata:type_name -> quorum.raft.v1.SnapshotMetadata
 	1,  // 9: quorum.raft.v1.WalEntryBatch.entries:type_name -> quorum.raft.v1.Entry
-	3,  // 10: quorum.raft.v1.WalSnapshotPointer.metadata:type_name -> quorum.raft.v1.SnapshotMetadata
-	4,  // 11: quorum.raft.v1.RaftTransport.Stream:input_type -> quorum.raft.v1.Message
-	13, // 12: quorum.raft.v1.RaftTransport.Stream:output_type -> quorum.raft.v1.StreamSummary
-	12, // [12:13] is the sub-list for method output_type
-	11, // [11:12] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	2,  // 10: quorum.raft.v1.WalEntryBatch.hard_state:type_name -> quorum.raft.v1.HardState
+	3,  // 11: quorum.raft.v1.WalSnapshotPointer.metadata:type_name -> quorum.raft.v1.SnapshotMetadata
+	4,  // 12: quorum.raft.v1.RaftTransport.Stream:input_type -> quorum.raft.v1.Message
+	13, // 13: quorum.raft.v1.RaftTransport.Stream:output_type -> quorum.raft.v1.StreamSummary
+	13, // [13:14] is the sub-list for method output_type
+	12, // [12:13] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_quorum_raft_v1_raft_proto_init() }

@@ -180,16 +180,28 @@ message InstallSnapshotResponse {
 //
 //     [u32 length][u32 crc32c][u8 record type][payload]
 //
-// with the payload being one of the messages below. Protobuf is not
+// with the payload being one of the messages below, and the CRC covering the
+// length, the type and the payload. Protobuf is not
 // self-delimiting and gives no corruption detection, so the framing supplies
 // both. A torn tail is detected by the CRC and truncated, which is what makes
 // "recovery always yields a prefix of what was written" true rather than
 // hopeful.
 
-// WalEntryBatch is one Ready batch worth of appended entries. The batch is the
-// unit of atomicity: one batch, one fsync.
+// WalEntryBatch is everything one Ready batch makes durable: its entries and,
+// if it changed, the hard state. The batch is the unit of atomicity: one batch,
+// one record, one fsync.
+//
+// hard_state lives inside the batch rather than in a record of its own so that
+// a torn write can only lose a whole batch. With two records per batch, a crash
+// between them would recover entries without the hard state written alongside
+// them -- harmless only by an argument about what the core can emit in one
+// Ready, and that argument should not have to be re-checked every time the core
+// changes. One CRC over both makes it unconditional.
 message WalEntryBatch {
   repeated Entry entries = 1;
+
+  // Absent when the batch did not change term, vote or commit.
+  HardState hard_state = 2;
 }
 
 // WalSnapshotPointer is appended and fsynced only after the snapshot file it

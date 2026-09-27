@@ -19,13 +19,15 @@ write it has already been told succeeded, even if the leader that accepted it
 later dies. This is the same underlying problem etcd solves for Kubernetes'
 cluster state.
 
-> **Status: phase 1 of 8 — design complete, implementation starting.**
+> **Status: phase 3 of 8 — Raft elects, replicates and survives restarts.**
 >
-> The design decisions are made and written down in [DESIGN.md](DESIGN.md); the
-> roadmap and the acceptance criteria for each phase are in [PLAN.md](PLAN.md).
-> What exists today is the scaffold, the configuration layer, the protobuf
-> schemas that fix the log format and client contract, and the tests that keep
-> the consensus core honest. **No consensus logic is implemented yet.**
+> The consensus core runs in a deterministic simulator that checks Raft's
+> safety properties after every simulated tick, and each node persists to a
+> write-ahead log that recovers cleanly from a crash at any byte. There is
+> **no network service yet**: no gRPC, no client API, no separate processes.
+> Those are phase 5. The design is in [DESIGN.md](DESIGN.md), the roadmap and
+> acceptance criteria in [PLAN.md](PLAN.md), and what is actually verified in
+> [PROGRESS.md](PROGRESS.md).
 
 ---
 

@@ -24,8 +24,9 @@
 // message may leave the process before Sync returns, because a granted vote and
 // an accepted AppendEntries are both durable promises. etcd relaxes this for
 // follower appends as a throughput optimization. Quorum does not, and documents
-// the cost instead of taking the shortcut. Phase 3 adds a storage test double
-// that fails the test if a Send is observed before its corresponding Sync.
+// the cost instead of taking the shortcut. TestNoSendBeforeSync checks every
+// message every node sends against what that node's storage had made durable at
+// the instant of sending.
 //
 // Known hazard, stated up front rather than discovered later: because one
 // goroutine handles ticks, messages and durability, a slow fsync delays ticks
@@ -34,5 +35,7 @@
 // measured. Tick lag and fsync latency are therefore exported as metrics from
 // the first day the loop exists.
 //
-// Phase 2 fills this package in. It is currently a documented stub.
+// Phase 2 built the Ready processing shared with the simulator. The goroutine
+// loop above arrives with a transport that can deliver inbound messages to it,
+// which is phase 5's gRPC transport.
 package server

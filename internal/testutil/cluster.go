@@ -1,15 +1,54 @@
 package testutil
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"math/rand/v2"
+	"path/filepath"
 	"slices"
 
 	"github.com/Shashankkaranamr/Quorum/internal/server"
 	"github.com/Shashankkaranamr/Quorum/internal/storage"
+	"github.com/Shashankkaranamr/Quorum/internal/transport"
 	"github.com/Shashankkaranamr/Quorum/internal/transport/inmem"
 	"github.com/Shashankkaranamr/Quorum/raft"
 )
+
+// StorageFactory opens a node's storage. The cluster calls it when the node is
+// first created and again on every Restart, after the previous instance was
+// crashed, so what the node sees on restart is whatever the storage kept.
+type StorageFactory func(id raft.NodeID) (storage.Storage, error)
+
+// Crasher is storage that can be abandoned the way a killed process abandons
+// it: buffered, unsynced writes are lost. Storage the cluster runs on must
+// implement it, or Crash would not cost what a real crash costs.
+type Crasher interface {
+	Crash() error
+}
+
+// MemStorageFactory keeps one MemStorage per node for the life of the cluster.
+// A restarted node gets the same instance back, minus what Crash dropped.
+func MemStorageFactory() StorageFactory {
+	stores := map[raft.NodeID]*storage.MemStorage{}
+	return func(id raft.NodeID) (storage.Storage, error) {
+		if s, ok := stores[id]; ok {
+			return s, nil
+		}
+		s := storage.NewMem()
+		stores[id] = s
+		return s, nil
+	}
+}
+
+// WALStorageFactory runs every node on a real write-ahead log under root, one
+// directory per node. A restart reopens the directory, so the node comes back
+// through the same recovery path a real process does.
+func WALStorageFactory(root string, opts storage.WALOptions) StorageFactory {
+	return func(id raft.NodeID) (storage.Storage, error) {
+		return storage.OpenWAL(filepath.Join(root, fmt.Sprintf("node-%d", id), "wal"), opts)
+	}
+}
 
 // Options configure a simulated cluster.
 type Options struct {
@@ -32,6 +71,13 @@ type Options struct {
 	// simulator reproduces the head-of-line-blocking hazard: the driver cannot
 	// process ticks while storage is busy, so tick lag becomes non-zero.
 	SyncCostTicks int
+
+	// Storage opens each node's storage. Nil means MemStorageFactory.
+	Storage StorageFactory
+
+	// WrapTransport, if set, interposes on each node's outbound transport.
+	// The ordering tests use it to record exactly when a message leaves.
+	WrapTransport func(id raft.NodeID, t transport.Transport) transport.Transport
 
 	// UnsafeMutation deliberately breaks a Raft safety rule on every node. It
 	// exists only so the invariant checkers can be shown to catch a specific
@@ -63,7 +109,7 @@ func DefaultOptions(n int, seed uint64) Options {
 type Replica struct {
 	ID     raft.NodeID
 	Driver *server.Driver
-	Store  *storage.MemStorage
+	Store  storage.Storage
 	SM     *Recorder
 
 	// Down means the process is stopped: it receives nothing, ticks not at
@@ -148,9 +194,14 @@ func NewCluster(opts Options) (*Cluster, error) {
 		cachedRev: make(map[raft.NodeID]uint64, opts.N),
 	}
 
+	if c.Opts.Storage == nil {
+		c.Opts.Storage = MemStorageFactory()
+	}
+
 	for _, id := range ids {
-		r, err := c.newReplica(id, storage.NewMem())
+		r, err := c.newReplica(id)
 		if err != nil {
+			_ = c.Close()
 			return nil, err
 		}
 		c.Replicas[id] = r
@@ -161,8 +212,17 @@ func NewCluster(opts Options) (*Cluster, error) {
 // newReplica constructs one node. Each node gets its own random stream derived
 // from the cluster seed and its id, so that adding or removing a draw elsewhere
 // does not reshuffle a node's election timeouts.
-func (c *Cluster) newReplica(id raft.NodeID, store *storage.MemStorage) (*Replica, error) {
+func (c *Cluster) newReplica(id raft.NodeID) (*Replica, error) {
 	rng := rand.New(rand.NewPCG(c.Opts.Seed, uint64(id)*0x9e3779b97f4a7c15+1))
+
+	store, err := c.Opts.Storage(id)
+	if err != nil {
+		return nil, fmt.Errorf("testutil: open storage for node %d: %w", id, err)
+	}
+	if _, ok := store.(Crasher); !ok {
+		return nil, fmt.Errorf("testutil: storage %T for node %d cannot be crashed, "+
+			"so the simulator could not make a crash cost what it really costs", store, id)
+	}
 
 	hs, ents, applied, err := store.InitialState()
 	if err != nil {
@@ -199,11 +259,14 @@ func (c *Cluster) newReplica(id raft.NodeID, store *storage.MemStorage) (*Replic
 		return nil, err
 	}
 
-	store.SyncCostTicks = c.Opts.SyncCostTicks
+	trans := c.Net.TransportFor(id)
+	if c.Opts.WrapTransport != nil {
+		trans = c.Opts.WrapTransport(id, trans)
+	}
 	rec := &Recorder{id: id, cluster: c}
 	r := &Replica{
 		ID:     id,
-		Driver: server.New(node, store, c.Net.TransportFor(id), rec),
+		Driver: server.New(node, store, trans, rec),
 		Store:  store,
 		SM:     rec,
 		rng:    rng,
@@ -246,9 +309,9 @@ func (c *Cluster) Tick() {
 			continue
 		}
 
-		before := r.Store.SyncCount
+		before := r.Driver.Metrics().Syncs
 		c.guard(id, "processing ready", func() error { return r.Driver.Run() })
-		if r.Store.SyncCount > before && c.Opts.SyncCostTicks > 0 {
+		if r.Driver.Metrics().Syncs > before && c.Opts.SyncCostTicks > 0 {
 			r.busyUntil = c.tick + uint64(c.Opts.SyncCostTicks)
 		}
 	}
@@ -404,7 +467,9 @@ func (c *Cluster) Crash(id raft.NodeID) {
 		return
 	}
 	r.Down = true
-	r.Store.DropPending()
+	if err := r.Store.(Crasher).Crash(); err != nil {
+		c.StepErrors = append(c.StepErrors, fmt.Errorf("tick %d: crash node %d: %w", c.tick, id, err))
+	}
 	delete(c.Checker.leaderLog, id)
 }
 
@@ -414,7 +479,7 @@ func (c *Cluster) Restart(id raft.NodeID) error {
 	if r == nil || !r.Down {
 		return nil
 	}
-	fresh, err := c.newReplica(id, r.Store)
+	fresh, err := c.newReplica(id)
 	if err != nil {
 		return err
 	}
@@ -426,6 +491,25 @@ func (c *Cluster) Restart(id raft.NodeID) error {
 	delete(c.cachedLog, id)
 	delete(c.cachedRev, id)
 	return nil
+}
+
+// Close releases every live node's storage. A cluster on a real write-ahead log
+// holds open files, which on Windows would stop the test's temporary directory
+// from being removed.
+func (c *Cluster) Close() error {
+	var errs []error
+	for _, id := range c.IDs {
+		r := c.Replicas[id]
+		if r == nil || r.Down {
+			continue
+		}
+		if cl, ok := r.Store.(io.Closer); ok {
+			if err := cl.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("node %d: %w", id, err))
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Partition splits the cluster. Messages between groups are dropped in both

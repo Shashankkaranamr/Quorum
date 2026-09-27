@@ -9,7 +9,7 @@ that would fail if the claim were untrue, or says which phase adds that test.
 Where it claims less than the reader might assume, it says so explicitly —
 see [§6, What this will and will not guarantee](#6-what-this-will-and-will-not-guarantee).
 
-**Status:** phase 2 of 8 complete. Sections 1–6 are decided. Where the
+**Status:** phase 3 of 8 complete. Sections 1–6 are decided. Where the
 implementation has since diverged from them, §10 records what changed and why;
 see [PLAN.md](PLAN.md) for the roadmap and [PROGRESS.md](PROGRESS.md) for where
 the work actually is.
@@ -102,7 +102,7 @@ this project is trying to demonstrate.
 | Config | `go.yaml.in/yaml/v3` (the maintained successor to the archived `gopkg.in/yaml.v3`) |
 | Tests | stdlib `testing` + `github.com/stretchr/testify/require` |
 | Linearizability checking | `github.com/anishathalye/porcupine` (phase 5) |
-| Goroutine-leak detection | `go.uber.org/goleak` (phase 3; vacuous earlier, see §10) |
+| Goroutine-leak detection | `go.uber.org/goleak` (phase 5, with the first goroutine; vacuous earlier, see §10) |
 | Lint | `golangci-lint` + `go vet` |
 
 Generated protobuf code is **checked in**, so cloning and running `make test`
@@ -189,8 +189,9 @@ granted vote and an accepted `AppendEntries` are both durable promises; sending
 either before it is on disk means a crash can make the node contradict itself,
 and two leaders in one term follows directly. etcd relaxes this for follower
 appends as a throughput optimization. Quorum does not, and pays the latency
-instead. Phase 3 adds a storage test double that fails the test if a `Send` is
-observed before its corresponding `Sync`.
+instead. `TestNoSendBeforeSync` audits every message every node sends, at the
+instant it is handed to the transport, against what that node's storage had
+made durable by then.
 
 Steps 1–6 are extracted into a function shared by the real driver and the
 deterministic simulator, so the ordering itself is covered by the fast tests
@@ -245,10 +246,16 @@ data/node-<id>/
   snap/<index>-<term>.snap  state machine snapshots
 ```
 
-`HardState` is written **as a record type inside the WAL**, not to a separate
-file. That avoids atomic-rename and directory-fsync entirely — neither is
-portable to Windows, and getting them subtly wrong is a classic source of
-"durable" data that is not.
+`HardState` is written **inside the WAL**, not to a separate file. That avoids
+atomic-rename entirely — it is not portable to Windows, and getting it subtly
+wrong is a classic source of "durable" data that is not.
+
+Directory fsync is avoided on the hot path but not entirely: creating a segment
+(once per 16 MiB) makes the new file's directory entry durable before anything
+is written into it. On Unix that is an fsync of the directory. Windows has no
+directory fsync; there the WAL relies on NTFS journalling the file's creation
+and on `FlushFileBuffers` of the file itself committing its metadata. That is
+the platform's documented behaviour, not something Quorum can verify.
 
 ### Record framing
 
@@ -257,21 +264,43 @@ portable to Windows, and getting them subtly wrong is a classic source of
 ```
 
 Protobuf is neither self-delimiting nor corruption-detecting, so the framing
-supplies both. Record types are `HardState`, `WalEntryBatch` and
-`WalSnapshotPointer`, all defined in
-[`proto/quorum/raft/v1/raft.proto`](proto/quorum/raft/v1/raft.proto) — the same
-types that go on the wire. **One serialization format to get right, one to
-fuzz.**
+supplies both. The CRC covers the length, the type and the payload, so a
+corrupted length is caught by the checksum rather than only by whatever lies at
+the offset it points to. Integers are little-endian; a record is capped at 64
+MiB so a flipped high bit cannot make recovery allocate gigabytes.
+
+There are two record types, both defined in
+[`proto/quorum/raft/v1/raft.proto`](proto/quorum/raft/v1/raft.proto):
+`WalEntryBatch` — one Ready's entries **and** its hard state — and
+`WalSnapshotPointer` (phase 4). **Each `Sync()` writes exactly one record**, so
+a torn write can only ever lose a whole batch; there is no state in which a
+batch's entries are durable and its hard state is not. The entry and hard-state
+messages are the same types that go on the wire. **One serialization format to
+get right, one to fuzz.**
 
 ### Durability invariants
 
-- **One `Sync()` per Ready batch.** The batch is the unit of atomicity. A
-  phase-3 test asserts the fsync count matches the Ready count exactly.
+- **One `Sync()` per Ready batch, and at most one fsync.** The batch is the unit
+  of atomicity. A Ready with entries or hard state costs exactly one record and
+  one fsync however large it is; a Ready with neither (a leader's heartbeat)
+  costs none, because there is nothing to make durable. `TestOneFsyncPerReady`
+  measures every Sync individually.
 - **Recovery yields a prefix.** On startup, scan forward and stop at the first
-  record with a bad CRC or an impossible length, then truncate there. A torn
-  tail from a crash mid-write is never a partial record, and never a corrupt
-  one. Phase 3 tests this by truncating a real WAL at *every* byte offset and
-  requiring that recovery produces a clean prefix each time.
+  record with a bad CRC or an impossible length, then truncate there and fsync
+  the truncation before writing anything new. A torn tail from a crash
+  mid-write is never a partial record, and never a corrupt one.
+  `TestWALTruncationAtEveryOffset` truncates a real WAL at *every* byte offset.
+- **Damage that is not a torn tail stops the node.** A segment is closed only
+  after it is fully synced, so a bad record in any segment but the last cannot
+  be a torn write; neither can a missing segment, nor a record whose CRC is
+  valid but whose type or payload this binary cannot read. Truncating any of
+  those would discard records that had been made durable and promised to other
+  nodes. Recovery refuses to start instead, and says why.
+- **A failed write or fsync is fatal to the log.** After either, the WAL
+  refuses every further call. What a failed fsync left on disk is unknowable —
+  on Linux the dirty pages may already have been dropped, so a retry can report
+  success for data that is gone. The only safe recovery is a restart that
+  re-reads the disk.
 - **Payload before pointer, for snapshots.** Write and fsync the `.snap` file;
   *then* append and fsync a `WalSnapshotPointer`; *then* delete superseded WAL
   segments. A pointer therefore always names a complete file, and a complete
@@ -285,6 +314,14 @@ on Unix. **This protects against process crash and OS crash. It does not protect
 against a drive with a volatile write cache that ignores flush barriers on power
 loss.** No amount of application code can fix that, and claiming otherwise would
 be dishonest.
+
+**Nor does it detect every kind of media corruption.** Damage in the middle of
+the *last* segment, with valid records after it, is indistinguishable from a
+torn tail, and recovery truncates there — losing the valid records behind it.
+A torn write can only ever be at the end, so this cannot happen from a crash;
+it needs the disk to corrupt data at rest, which is outside the fault model
+(§6). Distinguishing the two would need a second copy or per-record sequence
+numbers; neither is worth its cost for a crash-fault system.
 
 ---
 
@@ -629,10 +666,20 @@ be complete, and phase 8 requires it to appear in the README.
 | Committed entries survive a leader kill | `TestLeaderFailoverPreservesCommitted` | ✅ 2 |
 | Tick lag is measurable | `TestTickLagIsMeasured` | ✅ 2 |
 | Wire and disk encoding round-trip | `TestMessageRoundTrip`, `TestEntryTypeValuesMatch` | ✅ 2 |
-| Nothing is sent before it is durable | `TestNoSendBeforeSync` | 3 |
-| Exactly one fsync per Ready batch | `TestOneFsyncPerReady` | 3 |
-| Recovery from a torn WAL yields a prefix | `TestWALTruncationAtEveryOffset` | 3 |
-| A restarted node never votes twice in a term | `TestRestartDoesNotDoubleVote` | 3 |
+| Nothing is sent before it is durable | `TestNoSendBeforeSync` | ✅ 3 |
+| That audit can actually fail | `TestDurabilityAuditCatchesMisorderedDrivers` | ✅ 3 |
+| One Sync per Ready; one fsync per Ready with durable state, never more | `TestOneFsyncPerReady` | ✅ 3 |
+| The WAL decoder never accepts a torn, partial or CRC-mismatched record | `FuzzWALDecode`, `TestWALCodecRejectsEveryBitFlip` | ✅ 3 |
+| That fuzz contract can actually fail | `TestDecodeContractCatchesBrokenDecoders` | ✅ 3 |
+| Recovery from a torn WAL yields a prefix | `TestWALTruncationAtEveryOffset` | ✅ 3 |
+| That prefix check can actually fail | `TestTruncationCheckDistinguishesEveryPrefix` | ✅ 3 |
+| Damage that is not a torn tail is refused, not truncated | `TestWALRefusesDamageThatIsNotATornTail` | ✅ 3 |
+| A restarted node never votes twice in a term | `TestRestartDoesNotDoubleVote` | ✅ 3 |
+| That double-vote check can actually fail | `TestDoubleVoteCheckCatchesAmnesia` | ✅ 3 |
+| A whole-cluster crash loses no committed entry | `TestClusterRestartRecoversCommitted` | ✅ 3 |
+| That restart check can actually fail | `TestRestartCheckCatchesLostCommittedEntries` | ✅ 3 |
+| The safety invariants hold with every node on real disk | `TestRandomizedTrialsUpholdSafetyOnDisk` | ✅ 3 |
+| The simulator's crash model matches the real log | `TestWALAgreesWithMemStorage` | ✅ 3 |
 | Snapshot + tail reproduces exact state | `TestSnapshotRestoreIsIdentical` | 4 |
 | Dedup survives snapshot restore | `TestSessionsSurviveSnapshot` | 4 |
 | A partitioned leader will not serve a stale read | `TestPartitionedLeaderRefusesRead` | 5 |
@@ -750,3 +797,38 @@ the purpose.
 **goleak is deferred from phase 2 to phase 3.** PLAN.md listed it under phase 2.
 This phase has no goroutines at all by design, so the check is vacuous. It
 becomes meaningful when the real driver goroutine exists.
+
+### Phase 3
+
+**`WalEntryBatch` gained a `hard_state` field; `HardState` is no longer a
+record type of its own.** §2 originally listed three record types, with the
+hard state written as a separate record. Two records per Ready means a crash
+between them recovers the batch's entries without its hard state. That turns
+out to be harmless — nothing from the batch had been sent — but only by an
+argument about what the core can put in one Ready, and that argument would
+need re-checking every time the core changes. One record per Ready makes the
+batch atomic unconditionally, under one CRC. The change is a new field with a
+new number, which `buf breaking` accepts, and no WAL had been written before it.
+
+**A Ready with nothing durable costs no fsync.** PLAN.md's criterion said the
+fsync count increments exactly once per Ready. The driver still calls `Sync()`
+exactly once per Ready, but the WAL skips the fsync when the batch holds no
+entries and no hard state — which is every leader heartbeat. Fsyncing an
+unchanged file would add a disk flush to every heartbeat for no durability.
+Flagged in PLAN.md rather than silently applied.
+
+**The fsync cost knob moved from `MemStorage` to the simulator.**
+`SyncCostTicks` was a field on `MemStorage`; it is now only
+`testutil.Options.SyncCostTicks`, keyed off the driver's Sync count. That lets
+it apply equally when a simulated cluster runs on the real WAL.
+
+**The simulator's storage is pluggable.** `testutil.Options.Storage` takes a
+factory, called at start and again on every restart. `WALStorageFactory` puts
+each node on a real write-ahead log, so a simulated crash is followed by real
+recovery from disk. Storage the simulator runs on must be able to `Crash()` —
+drop buffered writes and release its files without flushing — or the
+simulator refuses it, because a crash that cost nothing would prove nothing.
+
+**goleak moves to phase 5.** This phase added no goroutines. The driver loop
+that will be the first one needs a transport that can deliver inbound
+messages, and that is phase 5's gRPC transport.

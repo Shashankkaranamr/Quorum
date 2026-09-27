@@ -1,24 +1,18 @@
 package storage
 
-import (
-	"fmt"
-
-	"github.com/Shashankkaranamr/Quorum/raft"
-)
+import "github.com/Shashankkaranamr/Quorum/raft"
 
 // MemStorage is an in-memory Storage for the deterministic simulator.
 //
-// It is not a stub. It models the two things about real storage that matter to
-// correctness:
+// It is not a stub. It models the one thing about real storage that matters to
+// correctness: Append and SetHardState buffer, and only Sync publishes. So a
+// node that "crashes" before Sync loses exactly what a real node would lose.
+// Batches are applied by the same function the write-ahead log's recovery
+// uses, so the two cannot disagree about what a batch means.
 //
-//  1. Append and SetHardState buffer; only Sync publishes. So a node that
-//     "crashes" before Sync loses exactly what a real node would lose, and the
-//     phase 3 crash tests can be written against this before the real
-//     write-ahead log exists.
-//  2. Sync can be made to cost logical ticks, which is what lets the simulator
-//     reproduce the head-of-line-blocking hazard DESIGN.md names: one goroutine
-//     owns ticks and durability, so a slow fsync delays ticks and can stall an
-//     election.
+// The cost of an fsync is modelled by the simulator rather than here
+// (testutil.Options.SyncCostTicks), so it applies equally to the real
+// write-ahead log when a simulated cluster runs on disk.
 //
 // It is not safe for concurrent use. Its owner is the single driver that owns
 // the node.
@@ -32,13 +26,7 @@ type MemStorage struct {
 	pendingEntries []raft.Entry
 	pendingHS      *raft.HardState
 
-	// SyncCostTicks is how many logical ticks a Sync takes. Zero means
-	// instant. The simulator withholds Ready processing for this many ticks,
-	// which makes tick lag real rather than a counter that is always zero.
-	SyncCostTicks int
-
-	// Counters. SyncCount is what phase 3's "exactly one fsync per Ready"
-	// test asserts on.
+	// Counters.
 	SyncCount      uint64
 	AppendCount    uint64
 	EntriesWritten uint64
@@ -71,22 +59,11 @@ func (m *MemStorage) SetHardState(hs raft.HardState) error {
 func (m *MemStorage) Sync() error {
 	m.SyncCount++
 
-	for _, e := range m.pendingEntries {
-		switch {
-		case e.Index == 0:
-			return fmt.Errorf("storage: entry with index 0")
-		case e.Index <= raft.Index(len(m.entries)):
-			// Overwrite: a leader corrected us. Truncate anything after it,
-			// because those entries belonged to a branch that lost.
-			m.entries = m.entries[:e.Index-1]
-			m.entries = append(m.entries, e)
-		case e.Index == raft.Index(len(m.entries))+1:
-			m.entries = append(m.entries, e)
-		default:
-			return fmt.Errorf("storage: non-contiguous entry at index %d, log ends at %d",
-				e.Index, len(m.entries))
-		}
+	entries, err := appendEntries(m.entries, m.pendingEntries)
+	if err != nil {
+		return err
 	}
+	m.entries = entries
 	m.pendingEntries = m.pendingEntries[:0]
 
 	if m.pendingHS != nil {
@@ -120,13 +97,13 @@ func (m *MemStorage) DurableHardState() raft.HardState { return m.hs }
 // this much.
 func (m *MemStorage) PendingCount() int { return len(m.pendingEntries) }
 
-// DropPending discards everything buffered but not yet synced.
+// Crash discards everything buffered but not yet synced.
 //
 // This is what a crash costs. A node killed with SIGKILL loses exactly the
-// writes that had not reached the disk, and modelling that here is what lets
-// the phase 3 crash tests be written against the simulator before the real
-// write-ahead log exists.
-func (m *MemStorage) DropPending() {
+// writes that had not reached the disk. The durable state stays, and the
+// simulator restarts the node from it by calling InitialState again.
+func (m *MemStorage) Crash() error {
 	m.pendingEntries = m.pendingEntries[:0]
 	m.pendingHS = nil
+	return nil
 }

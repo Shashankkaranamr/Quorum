@@ -16,13 +16,13 @@ a later phase is started before that.
 > we actually are** — what is built, what is verified, and what the next concrete
 > steps are. Check it before starting work.
 
-**Current status: phase 2 complete.**
+**Current status: phase 3 complete.**
 
 | Phase | Title | Status |
 |---|---|---|
 | 1 | Foundations and design | ✅ complete |
 | 2 | Core consensus: election and log replication | ✅ complete |
-| 3 | Crash-safe persistence | not started |
+| 3 | Crash-safe persistence | ✅ complete |
 | 4 | Snapshotting and log compaction | not started |
 | 5 | gRPC KV service, linearizable reads, deduplication | not started |
 | 6 | Fault-injection suite and bug log | not started |
@@ -104,9 +104,9 @@ anyway and which make the durability ordering testable from the fast suite.
    something, then heals and requires full reconvergence — including an
    assertion that the minority was genuinely behind first, so the test cannot
    pass vacuously.
-8. ✅ `make race` is clean (59s). ⬜ **goleak is deferred to phase 3.** It is
-   vacuous here: this phase has no goroutines at all, by design. It becomes
-   meaningful when the real driver goroutine exists.
+8. ✅ `make race` is clean (59s). ⬜ **goleak is deferred** (to phase 3, and
+   then again to phase 5). It is vacuous here: this phase has no goroutines at
+   all, by design. It becomes meaningful when the real driver goroutine exists.
 
 **Also delivered beyond the original criteria**
 
@@ -122,35 +122,96 @@ anyway and which make the durability ordering testable from the fast suite.
 
 ---
 
-## Phase 3 — Crash-safe persistence
+## Phase 3 — Crash-safe persistence ✅
 
 **Goal.** A node that restarts never loses or contradicts what it already
 agreed to, and the fsync boundary is auditable.
 
-**Deliverables.** `internal/storage/` WAL, framing codec, recovery; the
-`Storage` implementation behind the driver; fsync metrics.
+**Delivered.** `internal/storage/`: the framing codec (`codec.go`), the
+segmented write-ahead log with recovery (`wal.go`), and fsync counters and
+latency (`WALStats`). The simulator can now run any node on a real WAL
+(`testutil.WALStorageFactory`), so every crash test below exercises real
+recovery from disk rather than a model of it. One format addition, recorded in
+DESIGN.md §10: `WalEntryBatch` gained a `hard_state` field, so each Ready is
+exactly one CRC-protected record.
 
 **Acceptance criteria**
 
-1. **The codec round-trips and survives garbage.** `TestWALCodecRoundTrip` plus
-   `FuzzWALDecode`: the decoder must never panic, never return a record it did
-   not fully read, and never accept a record whose CRC does not match.
-2. **A torn tail yields a prefix.** `TestWALTruncationAtEveryOffset`: write a
-   known WAL, truncate it at **every byte offset**, and require that recovery
-   returns a clean prefix of the original records every single time — never a
-   partial record, never an error that loses valid earlier records.
-3. **Nothing is sent before it is durable.** `TestNoSendBeforeSync`: a storage
-   test double records call order and fails the test if any message in a Ready
-   is handed to the transport before that Ready's `Sync()` returned.
-4. **One fsync per Ready.** `TestOneFsyncPerReady`: the fsync counter increments
-   exactly once per processed Ready batch, regardless of how many entries it
-   contains.
-5. **A restart never double-votes.** `TestRestartDoesNotDoubleVote`: crash a
-   node after it grants a vote but before the term advances; on restart it must
-   refuse a second vote in the same term.
-6. **Whole-cluster restart loses nothing.** `TestClusterRestartRecoversCommitted`:
-   crash all nodes, restart them all, and require every entry that was committed
-   before the crash to still be committed and applied.
+1. ✅ **The codec round-trips and survives garbage.** `TestWALCodecRoundTrip`
+   covers every record type alone and back to back. `FuzzWALDecode` holds the
+   decoder to its contract at every record boundary of its input -- never
+   panic, never consume bytes on error, never return a record it did not read
+   in full, never accept a CRC mismatch (recomputed independently) -- and ran
+   2.2 million executions over two minutes with no failure.
+   `TestWALCodecRejectsEveryBitFlip` is the deterministic complement.
+   Negative control: `TestDecodeContractCatchesBrokenDecoders` points the
+   contract at three deliberately broken decoders and requires each to fail.
+2. ✅ **A torn tail yields a prefix.** `TestWALTruncationAtEveryOffset`
+   truncates a real 8-record WAL at every one of its 254 byte offsets. Each time
+   recovery must return exactly the whole records before the tear, report
+   exactly the bytes it cut, and accept a new write that then survives a second
+   recovery -- which is what proves the torn bytes were really removed.
+   Negative control: `TestTruncationCheckDistinguishesEveryPrefix` requires
+   every prefix to recover to a distinct state (otherwise a lost record would
+   be invisible) and the check to reject the neighbouring prefix on both sides
+   at every offset. Separately, making recovery skip the truncation was
+   observed to fail the test at byte 4.
+3. ✅ **Nothing is sent before it is durable.** `TestNoSendBeforeSync` wraps
+   every node's storage and transport in an audit that checks each outbound
+   message, at the instant it is handed over, against what that node had made
+   durable: a granted vote needs the vote on disk, an acknowledged index needs
+   the entries on disk, any message needs its term on disk. It runs across
+   randomized schedules with crashes and restarts, 40 seeds on the simulator's
+   storage and 3 on the real WAL per cluster size: about 138,000 messages.
+   Negative control: `TestDurabilityAuditCatchesMisorderedDrivers` processes a
+   real Ready in two wrong orders and requires the audit to flag both, and
+   processes a correct Ready spanning two terms and requires it not to.
+4. ✅ **One fsync per Ready -- refined, see below.**
+   `TestOneFsyncPerReady` measures every Sync individually on a real WAL: the
+   driver makes exactly one Sync per Ready; a Ready carrying entries or hard
+   state costs exactly one fsync, including one carrying 500 entries; a Ready
+   carrying neither costs none.
+   *Refinement, flagged rather than silently applied:* the criterion as written
+   says the fsync counter increments exactly once per Ready. A Ready that
+   carries only messages or committed entries -- every leader heartbeat -- has
+   nothing to make durable, and fsyncing an unchanged file for it would add a
+   disk flush to every heartbeat for no durability at all. The WAL skips it.
+   What the test asserts is therefore "exactly one Sync per Ready, and exactly
+   one fsync per Ready that has anything durable in it, never more".
+5. ✅ **A restart never double-votes.** `TestRestartDoesNotDoubleVote`, on the
+   real WAL: grant a vote, crash, restart from disk, and a second candidate in
+   the same term is refused. It also crashes inside the fsync, where the vote
+   never became durable and so, by the ordering rule, was never sent.
+   Negative control: `TestDoubleVoteCheckCatchesAmnesia` runs the same scenario
+   on storage that forgets its hard state and requires the double vote to be
+   caught.
+6. ✅ **Whole-cluster restart loses nothing.**
+   `TestClusterRestartRecoversCommitted`: 12 runs (3 and 5 nodes, 6 seeds
+   each) on real WALs build a history with message loss and individual
+   crashes, then crash every node at once and restart them all from disk. Every
+   committed entry (84 to 116 per run) is re-applied identically on every node,
+   and the cluster then commits new entries. Negative control:
+   `TestRestartCheckCatchesLostCommittedEntries` runs it on storage that loses
+   the newest committed entry in recovery, and requires the loss to be caught.
+
+**Also delivered beyond the original criteria**
+
+- `TestRandomizedTrialsUpholdSafetyOnDisk`: phase 2's randomized safety trials
+  with every node on a real WAL, so every simulated crash is followed by real
+  recovery. All invariants hold.
+- `TestWALAgreesWithMemStorage`: a differential test that the simulator's crash
+  model and the real log agree exactly after reopening, including overwrites
+  of uncommitted suffixes and segment rolls.
+- `TestWALRefusesDamageThatIsNotATornTail`: damage in a closed segment, a
+  missing segment, or a record with a valid CRC that this binary cannot read
+  all stop the node from starting, rather than being truncated away.
+- A real bug in the new ordering audit, found by the randomized run and
+  recorded in BUGS.md (2026-09-27).
+
+**Not done, and why.** goleak moves again, to phase 5. This phase added no
+goroutines: the WAL is owned by the driver and the driver is still stepped by
+the simulator. The goroutine loop needs a transport that can deliver inbound
+messages, which is phase 5's gRPC transport.
 
 ---
 

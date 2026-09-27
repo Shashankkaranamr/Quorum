@@ -34,7 +34,10 @@ type Metrics struct {
 	MessagesSent    uint64
 	HardStateWrites uint64
 
-	// Syncs is the fsync count. Phase 3 asserts exactly one per Ready batch.
+	// Syncs counts Sync calls: exactly one per Ready batch, which
+	// TestOneFsyncPerReady asserts. Whether a Sync costs a real fsync is the
+	// storage's business -- the write-ahead log skips it when the batch has
+	// nothing durable in it -- and WAL.Stats().Fsyncs counts those.
 	Syncs uint64
 
 	TicksProcessed uint64
@@ -61,10 +64,11 @@ func (d *Driver) TickLagTicks() uint64 { return d.pendingTicks }
 // Driver owns a raft.Node and is the only place in the system where I/O
 // ordering is decided.
 //
-// In phase 2 it is stepped synchronously by the simulator. In phase 3 and
-// beyond the same struct is driven by one goroutine selecting on a ticker and
-// an inbound channel. The body -- ProcessReady below -- is identical in both,
-// which is what makes the fast tests cover the real ordering.
+// The simulator steps it synchronously. From phase 5, when a transport exists
+// that can deliver inbound messages, the same struct is driven by one
+// goroutine selecting on a ticker and an inbound channel. The body --
+// ProcessReady below -- is identical in both, which is what makes the fast
+// tests cover the real ordering.
 type Driver struct {
 	node  *raft.Node
 	store storage.Storage

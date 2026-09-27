@@ -20,9 +20,9 @@ import "github.com/Shashankkaranamr/Quorum/raft"
 // crash in that window lets a node contradict itself -- two leaders in one term
 // follows directly.
 //
-// Phase 2 satisfies this with MemStorage. Phase 3 puts the real write-ahead log
-// behind the same interface, and the ordering tests written against MemStorage
-// keep working unchanged.
+// MemStorage satisfies it for the simulator and WAL for real nodes. The
+// simulator can run on either, which is how the crash tests exercise real
+// recovery from disk.
 type Storage interface {
 	// Append buffers entries. Entries already present at those indices are
 	// overwritten, which is how a follower accepts a leader's correction.

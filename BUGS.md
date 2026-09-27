@@ -54,6 +54,74 @@ Optional. Whether this was a slip or a sign the design was wrong somewhere.
 
 ---
 
+## 2026-09-27 — The durability audit flagged a correct Ready that spanned two terms
+
+**Phase:** 3
+**Severity:** correctness of tests
+
+**Symptom observed.**
+The first full run of `TestNoSendBeforeSync` failed one variant (simulator
+storage, five nodes) on seed 32 of 40:
+
+```
+node 1 sent RequestVoteResp 1->2 t14 granted=true:
+  granting a vote that is not durable (durable term=18 vote=3)
+```
+
+Seeds 0 to 31 had passed before it (the test stops at the first failure, so
+the remaining seeds of that variant did not run), and the other three
+variants passed in full, including every seed on the real write-ahead log.
+Every Raft safety invariant held on seed 32 itself.
+
+**Root cause.**
+The audit's rule for a granted vote was "the durable hard state names this term
+and this candidate". That is the property stated one message at a time — but the
+unit of durability is not the message, it is the Ready.
+
+One Ready can span several steps. Node 1 granted candidate 2 in term 14; then,
+before its next Ready was processed, it received a term-18 message and voted for
+candidate 3. Only the final hard state, term 18 and vote 3, is written. The
+term-14 grant was never durable on its own, and it does not need to be: the
+whole batch is durable before any of it is sent, so the disk holds exactly what
+a node that persisted after every single step would hold. A node whose disk says
+term 18 can never act in term 14 again, so its term-14 promise cannot be
+contradicted.
+
+The rule confused "the promise is in the durable state" with "the durable state
+is at or beyond the promise". It took a randomized schedule to find because the
+triggering Ready needs two vote requests from different terms to arrive at one
+node between two consecutive Ready cycles.
+
+While fixing it I also found, by reading rather than by a failing test, that the
+harness replaced a node's audit when the node restarted. Any violation recorded
+before a crash would have been dropped from the final check. The audits of every
+life are now kept, and the test requires that at least one restart happened.
+
+**Fix.**
+A message stamped with a term older than the node's durable term is covered by
+that durable term. The structural checks — nothing sent during a Sync, nothing
+sent with writes still buffered — still apply to every message. See
+`durabilityAudit.checkSend` in `internal/server/driver_test.go`.
+
+**Regression test.**
+`TestDurabilityAuditCatchesMisorderedDrivers`, subtest *correct order, one Ready
+spanning two terms*, builds this exact Ready deterministically: a vote request
+in term 1, then one in term 2, then a single Ready. Against the pre-fix audit it
+fails with `granting a vote that is not durable (durable term=2 vote=3)`; this
+was run and observed before the fix went in. The same test's other subtests
+require the fixed audit to still catch two genuinely misordered drivers.
+
+**What it says about the design.**
+Nothing is wrong with Raft or the driver; this was a checker that was too
+strict. It is still worth recording, for two reasons. It is the argument for why
+a batched Ready is safe at all, written down where the next person will find it.
+And the tempting "fix" in the other direction — make the driver persist after
+every step so that the per-message rule holds — would have been a real
+performance regression, driven by a wrong test. A false positive from a safety
+checker deserves the same scrutiny as a true one.
+
+---
+
 ## 2026-09-23 — Failure-message arguments evaluated on every passing assertion
 
 **Phase:** 2
@@ -162,7 +230,17 @@ found" stays visible.*
   bug structurally hard to write — the consensus core holds no locks and
   performs no I/O — while relocating the same *symptom* to a different cause:
   head-of-line blocking in the single driver goroutine, where a slow fsync
-  delays ticks and can stall an election. `Metrics.tick_lag_ticks` and
-  `Metrics.fsync_p99_micros` exist from the first version of that loop
+  delays ticks and can stall an election. The driver's tick-lag metrics
+  (`MaxTickLagTicks`, `TotalTickLagTicks`) exist from the first version of that
+  loop, and phase 3 added fsync latency (`WALStats.FsyncMax`, `FsyncTotal`),
   specifically so this is measurable rather than mysterious. Whether it actually
   happens will be recorded here either way.
+
+- **A write-ahead log recovery bug during phase 3.** None found. The decoder
+  was fuzzed for 2.2 million executions, a real WAL was recovered after
+  truncation at every byte offset, and every node in the randomized safety
+  trials ran on a real WAL through repeated crashes. As with phase 2, that is a
+  claim about what the tests found, and it is only worth anything because each
+  check was separately shown to fail on a deliberately broken input: three
+  broken decoders, a recovery with its truncation removed, storage that forgets
+  its vote, and storage that loses a committed entry.

@@ -71,7 +71,10 @@ type trialStats struct {
 	hadLeader   bool
 }
 
-func runRandomizedTrial(t *testing.T, n int, seed uint64) trialStats {
+// runRandomizedTrial runs one seeded trial. configure, if given, adjusts the
+// cluster options before it is built -- the on-disk variant uses it to put
+// every node on a real write-ahead log.
+func runRandomizedTrial(t *testing.T, n int, seed uint64, configure ...func(*testutil.Options)) trialStats {
 	t.Helper()
 
 	rng := rand.New(rand.NewPCG(seed, 0x5deece66d))
@@ -84,8 +87,13 @@ func runRandomizedTrial(t *testing.T, n int, seed uint64) trialStats {
 		ReorderDueBatch: true,
 	}
 
+	for _, f := range configure {
+		f(&opts)
+	}
+
 	c, err := testutil.NewCluster(opts)
 	require.NoError(t, err)
+	defer func() { require.NoError(t, c.Close()) }()
 
 	quorum := n/2 + 1
 	down := map[raft.NodeID]bool{}
