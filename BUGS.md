@@ -54,6 +54,100 @@ Optional. Whether this was a slip or a sign the design was wrong somewhere.
 
 ---
 
+## 2026-09-30 — The transport read its fault state outside its lock
+
+**Phase:** 5
+**Severity:** correctness of fault injection (a data race)
+
+**Symptom observed.**
+The first `make race` run with the phase 5 suite reported ten `WARNING: DATA
+RACE` reports. All were in `TestLinearizabilityUnderFaults` and its negative
+control. Every one paired a read in `grpcx.Transport.Send`, `Stream`,
+`peer.run` or `peer.stream` with a write in `Transport.Heal`, called from the
+test's fault-injection goroutine. Without `-race`, every test had passed.
+
+**Root cause.**
+The injected-fault state is two maps, of blocked outbound and blocked inbound
+links, guarded by one mutex. The check was written as
+`t.isBlocked(t.blockedIn, m.From)`, with `isBlocked` taking the lock and
+looking the id up. Go evaluates the argument `t.blockedIn` before the call, so
+the map field was read **before** the lock was taken. `Heal` replaces both maps
+under the lock. A stream handler could therefore read the field while `Heal`
+was writing it. The lock was taken in every function that touched the maps, and
+the read still happened outside it.
+
+This is the first lock in production code, and this project's architecture was
+chosen specifically to keep locks out of the consensus core (DESIGN.md §1).
+The bug is not in the core, and it is not the predicted stall. It is still a
+bug in the one place a lock was needed.
+
+**Fix.**
+`isBlocked` takes a direction instead of a map, and selects the map inside the
+lock (`internal/transport/grpcx/grpcx.go`).
+
+**Regression test.**
+`TestFaultStateIsSafeToChangeUnderTraffic` sends messages both ways between two
+transports while repeatedly partitioning and healing. Against the pre-fix code,
+under `-race`, it fails with six data-race reports; this was run and observed.
+After the fix it is clean, and so are three further `-race` runs of the whole
+node suite. It can only fail under the race detector, which `make ci` runs.
+
+**What it says about the design.**
+It supports keeping the list of shared state short. The mutex was in the right
+place, and every access went through a helper that took it. The helper's
+signature still let a read escape. Five lines of guarded state produced a real
+race, which is a fair measure of what a lock around the whole Raft state would
+have cost. It also shows why `make ci` includes `make race`: nothing else would
+have found this.
+
+---
+
+## 2026-09-30 — The linearizability workload could not produce a stale read
+
+**Phase:** 5
+**Severity:** correctness of tests
+
+**Symptom observed.**
+`TestLinearizabilityCatchesQuorumlessReads` failed on its first run: Porcupine
+judged the history **linearizable**. The test runs the same workload as
+`TestLinearizabilityUnderFaults`, against a cluster whose ReadIndex skips the
+quorum confirmation, with the leader repeatedly partitioned, and requires the
+checker to find a stale read. Lengthening the partitions from under a second to
+1.5s changed nothing: 10,869 operations, 5 partitions, verdict `Ok`, twice.
+
+**Root cause.**
+In the workload, every client both read and wrote. When the leader was cut off,
+each client's next write stalled on it until the 500ms request timeout, then
+moved on to the new leader. All of them stalled on their first write after the
+cut and all left at about the same moment. After that, nobody was reading from
+the old leader. A stale read needs a write to complete on the new leader while
+some client still reads from the old one, and this workload never arranged
+that. So the main test could not have detected stale reads from a partitioned
+leader, which is the failure ReadIndex exists to prevent. It was passing, but
+not for that reason.
+
+**Fix.**
+Client 0 only reads. A read-only client stays with the node it believes leads
+for as long as that node answers, as real read-mostly clients do. The same
+workload runs in both tests.
+
+**Regression test.**
+`TestLinearizabilityCatchesQuorumlessReads` itself. With the read-only client it
+returns `Illegal` on every run (three of three observed, about 11,000
+operations each), while `TestLinearizabilityUnderFaults` still returns `Ok`
+against correct ReadIndex. The hand-built control,
+`TestLinearizabilityCheckerRejectsAStaleRead`, passed throughout. That is why it
+is not enough on its own: it proves the checker, not the workload.
+
+**What it says about the design.**
+This is the third time a negative control has caught a test that could not fail
+(see phase 2's reconvergence entry and phase 4's restore entry). The pattern is
+consistent: the checker was fine and the workload never produced the failure.
+An end-to-end control, which injects a real bug and runs the real workload, is
+worth more than a hand-built history.
+
+---
+
 ## 2026-09-30 — A refused recovery kept the log's tail segment open
 
 **Phase:** 4 (the defect dates from phase 3)
@@ -371,7 +465,13 @@ found" stays visible.*
   (`MaxTickLagTicks`, `TotalTickLagTicks`) exist from the first version of that
   loop, and phase 3 added fsync latency (`WALStats.FsyncMax`, `FsyncTotal`),
   specifically so this is measurable rather than mysterious. Whether it actually
-  happens will be recorded here either way.
+  happens will be recorded here either way. *Phase 5:* the real driver loop now
+  exists, and no election stall has been observed. That covers roughly 25,000
+  client operations under leader kills and partitions at a 10ms tick, and a
+  real three-process cluster. The project's first production lock **did** have
+  a bug: a data race in the transport's fault-injection state (2026-09-30,
+  above). It was a race, not a stall, and it was not in the consensus code.
+  Phase 6 is where tick lag is measured under a deliberately slow disk.
 
 - **A write-ahead log recovery bug during phase 3.** None found. The decoder
   was fuzzed for 2.2 million executions, a real WAL was recovered after

@@ -35,7 +35,9 @@
 // measured. Tick lag and fsync latency are therefore exported as metrics from
 // the first day the loop exists.
 //
-// Phase 2 built the Ready processing shared with the simulator. The goroutine
-// loop above arrives with a transport that can deliver inbound messages to it,
-// which is phase 5's gRPC transport.
+// Phase 2 built the Ready processing shared with the simulator; phase 5 added
+// Loop, the goroutine that runs it against the real clock. Loop owns the node,
+// the storage, the state machine and every pending request, and RPC handlers
+// reach it only through channels -- so the pending-proposal registry DESIGN.md
+// §1 expected to need a lock needs none.
 package server

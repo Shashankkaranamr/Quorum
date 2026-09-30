@@ -14,6 +14,5 @@
 // duplicating or reordering a message must never violate safety, only
 // liveness. The deterministic simulator does all four on purpose.
 //
-// Phase 2 defines the interface and inmem; phase 5 adds grpcx. It is currently
-// a documented stub.
+// Phase 2 defined the interface and inmem; phase 5 added grpcx.
 package transport

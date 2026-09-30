@@ -53,6 +53,7 @@ func (n *Node) sendAppend(to NodeID) {
 		PrevLogTerm:  prevTerm,
 		Entries:      ents,
 		LeaderCommit: n.log.committed,
+		ReadSeq:      n.readSeq,
 	})
 }
 
@@ -214,18 +215,23 @@ func (n *Node) handleAppendEntries(m Message) {
 		// commit index so the leader resumes from there. Rejecting instead
 		// would hand it a conflict hint above its nextIndex, which it rightly
 		// refuses to move forward on, and the two would stall.
-		n.send(Message{Type: MsgAppendEntriesResp, To: m.From, Success: true, MatchIndex: n.log.committed})
+		n.send(Message{Type: MsgAppendEntriesResp, To: m.From, Success: true, MatchIndex: n.log.committed,
+			ReadSeq: m.ReadSeq})
 		return
 	}
 
 	if !n.log.matchTerm(m.PrevLogIndex, m.PrevLogTerm) {
 		ci, ct := n.log.conflictHint(m.PrevLogIndex)
+		// Even a rejection echoes the read round: it proves this node still
+		// recognizes the sender as leader of this term, which is all ReadIndex
+		// asks.
 		n.send(Message{
 			Type:          MsgAppendEntriesResp,
 			To:            m.From,
 			Success:       false,
 			ConflictIndex: ci,
 			ConflictTerm:  ct,
+			ReadSeq:       m.ReadSeq,
 		})
 		return
 	}
@@ -271,6 +277,7 @@ func (n *Node) handleAppendEntries(m Message) {
 		To:         m.From,
 		Success:    true,
 		MatchIndex: lastNew,
+		ReadSeq:    m.ReadSeq,
 	})
 }
 
@@ -282,6 +289,13 @@ func (n *Node) handleAppendEntriesResponse(m Message) {
 	pr := n.progress[m.From]
 	if pr == nil {
 		return
+	}
+
+	// Any response in our term, success or not, is this peer acknowledging us
+	// as leader. Step has already discarded responses from older terms.
+	if m.ReadSeq > n.readAcks[m.From] {
+		n.readAcks[m.From] = m.ReadSeq
+		n.confirmReads()
 	}
 
 	if m.Success {
@@ -421,5 +435,15 @@ func (n *Node) maybeCommit() bool {
 		return false
 	}
 
-	return n.log.commitTo(quorumIndex)
+	if !n.log.commitTo(quorumIndex) {
+		return false
+	}
+	if len(n.unrounded) > 0 && n.committedInTerm() {
+		// The term's first commit: the leader now knows its commit index, so
+		// reads that were waiting for it can start their round.
+		ids := n.unrounded
+		n.unrounded = nil
+		n.startReadRound(ids...)
+	}
+	return true
 }

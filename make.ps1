@@ -201,7 +201,7 @@ function Target-Run {
     Target-Build
     Invoke-Checked { & "./$Bin/quorumctl" plan -config $Config }
     Write-Host ''
-    Invoke-Checked { & "./$Bin/quorum-node" -id 1 -config $Config }
+    Invoke-Checked { & "./$Bin/quorum-node" -id 1 -config $Config -describe }
 }
 
 function Target-Up {

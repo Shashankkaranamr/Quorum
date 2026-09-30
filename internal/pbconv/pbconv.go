@@ -1,6 +1,7 @@
 package pbconv
 
 import (
+	"encoding/binary"
 	"fmt"
 
 	raftv1 "github.com/Shashankkaranamr/Quorum/gen/quorum/raft/v1"
@@ -157,6 +158,27 @@ func SnapshotMetaFromProto(p *raftv1.SnapshotMetadata) raft.SnapshotMeta {
 	}
 }
 
+// The core numbers ReadIndex rounds with a uint64. On the wire it travels in the
+// read_context bytes field that was reserved for it in phase 1, as 8
+// little-endian bytes, or not at all when zero.
+func readContext(seq uint64) []byte {
+	if seq == 0 {
+		return nil
+	}
+	return binary.LittleEndian.AppendUint64(nil, seq)
+}
+
+func readSeq(ctx []byte) (uint64, error) {
+	switch len(ctx) {
+	case 0:
+		return 0, nil
+	case 8:
+		return binary.LittleEndian.Uint64(ctx), nil
+	default:
+		return 0, fmt.Errorf("pbconv: read_context is %d bytes, want 0 or 8", len(ctx))
+	}
+}
+
 // MessageToProto converts a Raft message to its wire form.
 //
 // The core uses a flat struct with a type tag; the wire uses a oneof. The
@@ -192,6 +214,7 @@ func MessageToProto(m raft.Message) (*raftv1.Message, error) {
 			PrevLogTerm:  uint64(m.PrevLogTerm),
 			Entries:      ents,
 			LeaderCommit: uint64(m.LeaderCommit),
+			ReadContext:  readContext(m.ReadSeq),
 		}}
 
 	case raft.MsgAppendEntriesResp:
@@ -201,6 +224,7 @@ func MessageToProto(m raft.Message) (*raftv1.Message, error) {
 				MatchIndex:    uint64(m.MatchIndex),
 				ConflictTerm:  uint64(m.ConflictTerm),
 				ConflictIndex: uint64(m.ConflictIndex),
+				ReadContext:   readContext(m.ReadSeq),
 			},
 		}
 
@@ -258,6 +282,9 @@ func MessageFromProto(p *raftv1.Message) (raft.Message, error) {
 		m.PrevLogTerm = raft.Term(b.AppendEntries.GetPrevLogTerm())
 		m.Entries = ents
 		m.LeaderCommit = raft.Index(b.AppendEntries.GetLeaderCommit())
+		if m.ReadSeq, err = readSeq(b.AppendEntries.GetReadContext()); err != nil {
+			return raft.Message{}, err
+		}
 
 	case *raftv1.Message_AppendEntriesResponse:
 		m.Type = raft.MsgAppendEntriesResp
@@ -265,6 +292,10 @@ func MessageFromProto(p *raftv1.Message) (raft.Message, error) {
 		m.MatchIndex = raft.Index(b.AppendEntriesResponse.GetMatchIndex())
 		m.ConflictTerm = raft.Term(b.AppendEntriesResponse.GetConflictTerm())
 		m.ConflictIndex = raft.Index(b.AppendEntriesResponse.GetConflictIndex())
+		var err error
+		if m.ReadSeq, err = readSeq(b.AppendEntriesResponse.GetReadContext()); err != nil {
+			return raft.Message{}, err
+		}
 
 	case *raftv1.Message_InstallSnapshot:
 		m.Type = raft.MsgInstallSnapshot

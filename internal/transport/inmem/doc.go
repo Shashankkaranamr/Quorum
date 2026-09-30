@@ -9,5 +9,5 @@
 // Supported faults: bidirectional and one-way partitions, uniform and targeted
 // message drops, bounded and unbounded delays, duplication, and reordering.
 //
-// Phase 2 fills this package in. It is currently a documented stub.
+// Phase 2 built it.
 package inmem

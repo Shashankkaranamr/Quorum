@@ -226,6 +226,13 @@ type Message struct {
 	// which makes a lost, duplicated or reordered chunk cost a retry rather
 	// than a corrupted image.
 	SnapshotBytesReceived uint64
+
+	// ReadSeq is the ReadIndex round an AppendEntries belongs to: the leader
+	// stamps every AppendEntries with its latest read sequence number, and
+	// the follower echoes it on its response. A response from a quorum
+	// echoing s proves the leader was still leader after every read up to s
+	// was registered. On the wire it is AppendEntries.read_context.
+	ReadSeq uint64
 }
 
 func (m Message) String() string {
@@ -236,11 +243,11 @@ func (m Message) String() string {
 	case MsgRequestVoteResp:
 		return fmt.Sprintf("%s %d->%d t%d granted=%v", m.Type, m.From, m.To, m.Term, m.VoteGranted)
 	case MsgAppendEntries:
-		return fmt.Sprintf("%s %d->%d t%d prev=%d@%d n=%d commit=%d",
-			m.Type, m.From, m.To, m.Term, m.PrevLogIndex, m.PrevLogTerm, len(m.Entries), m.LeaderCommit)
+		return fmt.Sprintf("%s %d->%d t%d prev=%d@%d n=%d commit=%d read=%d",
+			m.Type, m.From, m.To, m.Term, m.PrevLogIndex, m.PrevLogTerm, len(m.Entries), m.LeaderCommit, m.ReadSeq)
 	case MsgAppendEntriesResp:
-		return fmt.Sprintf("%s %d->%d t%d ok=%v match=%d conflict=%d@%d",
-			m.Type, m.From, m.To, m.Term, m.Success, m.MatchIndex, m.ConflictIndex, m.ConflictTerm)
+		return fmt.Sprintf("%s %d->%d t%d ok=%v match=%d conflict=%d@%d read=%d",
+			m.Type, m.From, m.To, m.Term, m.Success, m.MatchIndex, m.ConflictIndex, m.ConflictTerm, m.ReadSeq)
 	case MsgInstallSnapshot:
 		return fmt.Sprintf("%s %d->%d t%d snap=%d@%d off=%d n=%d done=%v",
 			m.Type, m.From, m.To, m.Term, m.SnapshotMeta.Index, m.SnapshotMeta.Term,
@@ -274,6 +281,18 @@ type Snapshot struct {
 // IsEmpty reports whether s is the zero snapshot, i.e. nothing is compacted.
 func (s Snapshot) IsEmpty() bool { return s.Meta.Index == 0 }
 
+// ReadState is the outcome of a ReadIndex request.
+//
+// When Lost is false, leadership was confirmed by a quorum after the request
+// was made, and the read may be served once the state machine has applied
+// Index. When Lost is true the node stopped being leader before it could
+// confirm, and the read must not be served here.
+type ReadState struct {
+	ID    uint64
+	Index Index
+	Lost  bool
+}
+
 // Ready is everything that must happen as a result of the steps taken since the
 // last Ready: what to persist, what to send, and what to apply.
 //
@@ -301,6 +320,11 @@ type Ready struct {
 
 	// CommittedEntries are ready to hand to the state machine.
 	CommittedEntries []Entry
+
+	// ReadStates are ReadIndex requests that were confirmed or abandoned.
+	// They promise nothing durable, so they may be acted on at any point in
+	// the Ready.
+	ReadStates []ReadState
 }
 
 // IsEmpty reports whether there is nothing to do.
@@ -309,7 +333,8 @@ func (rd Ready) IsEmpty() bool {
 		rd.HardState == nil &&
 		len(rd.Entries) == 0 &&
 		len(rd.Messages) == 0 &&
-		len(rd.CommittedEntries) == 0
+		len(rd.CommittedEntries) == 0 &&
+		len(rd.ReadStates) == 0
 }
 
 // SafetyViolation is panicked when the core reaches a state that Raft's safety

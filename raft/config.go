@@ -50,6 +50,12 @@ const (
 	// and nothing else, so the violation the checkers report is unambiguously
 	// Leader Append-Only rather than a cascade.
 	MutationLeaderTruncatesOwnLog
+
+	// MutationReadWithoutQuorum confirms a ReadIndex request the moment it is
+	// made, without waiting for a quorum to acknowledge the leader. A leader
+	// partitioned away from the majority then serves reads from its own,
+	// possibly stale, state -- the exact failure ReadIndex exists to prevent.
+	MutationReadWithoutQuorum
 )
 
 func (m Mutation) String() string {
@@ -64,6 +70,8 @@ func (m Mutation) String() string {
 		return "skip-up-to-date-check"
 	case MutationLeaderTruncatesOwnLog:
 		return "leader-truncates-own-log"
+	case MutationReadWithoutQuorum:
+		return "read-without-quorum"
 	default:
 		return fmt.Sprintf("mutation(%d)", uint8(m))
 	}
@@ -137,6 +145,9 @@ var (
 
 	// ErrStopped is returned once a node has been stopped.
 	ErrStopped = errors.New("raft: node stopped")
+
+	// ErrReadIDInUse is returned by ReadIndex for an id already pending.
+	ErrReadIDInUse = errors.New("raft: read id already pending")
 )
 
 func (c *Config) validate() error {

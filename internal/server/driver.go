@@ -97,6 +97,10 @@ type Driver struct {
 	// last snapshot before the log is compacted. Zero disables compaction.
 	snapshotThreshold uint64
 
+	// readStates collects ReadIndex outcomes from processed Readies until the
+	// owner takes them.
+	readStates []raft.ReadState
+
 	// syncedThisReady guards the ordering rule within one batch.
 	syncedThisReady bool
 }
@@ -131,6 +135,16 @@ func (d *Driver) Step(m raft.Message) error { return d.node.Step(m) }
 // Propose appends a command. Only a leader may propose.
 func (d *Driver) Propose(typ raft.EntryType, data []byte) (raft.Index, raft.Term, error) {
 	return d.node.Propose(typ, data)
+}
+
+// ReadIndex asks the core for a linearizable read point; see raft.Node.ReadIndex.
+func (d *Driver) ReadIndex(id uint64) error { return d.node.ReadIndex(id) }
+
+// TakeReadStates returns the ReadIndex outcomes seen since the last call.
+func (d *Driver) TakeReadStates() []raft.ReadState {
+	rs := d.readStates
+	d.readStates = nil
+	return rs
 }
 
 // Run hands over any accumulated ticks, processes one Ready batch, and compacts
@@ -287,6 +301,7 @@ func (d *Driver) ProcessReady() error {
 		}
 		d.metrics.EntriesApplied += uint64(len(rd.CommittedEntries))
 	}
+	d.readStates = append(d.readStates, rd.ReadStates...)
 
 	// 6. Done.
 	d.node.Advance()

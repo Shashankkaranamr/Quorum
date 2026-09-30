@@ -89,15 +89,19 @@ follows directly. etcd relaxes this as an optimization. **We do not.**
 One driver goroutine owns the `*raft.Node` exclusively and serializes all input
 through one `select`. Ownership replaces locking.
 
-Mutexes/atomics are permitted in exactly three places, and nowhere else without
-updating DESIGN.md §1:
+In production code, mutexes/atomics are permitted in exactly two places, and
+nowhere else without updating DESIGN.md §1:
 
-1. `internal/storage` — the WAL file handle.
-2. The status snapshot for the visualizer — immutable struct behind
-   `atomic.Pointer[Status]`.
-3. The pending-proposal registry (log index → result channel).
+1. The status snapshot — an immutable struct behind `atomic.Pointer`, published
+   by `server.Loop`.
+2. The injected-fault state in `internal/transport/grpcx` — one mutex.
 
-If you need a fourth, that is a design change, not an implementation detail.
+The WAL and the pending-proposal registry need none: `server.Loop` owns them,
+and RPC handlers reach the loop only through channels. (Phase 1 listed those
+two as needing locks; phase 5 found they did not, and the transport's fault
+state did. DESIGN.md §10 records it.) Test code may use whatever it needs.
+
+If you need a third, that is a design change, not an implementation detail.
 
 ### 3.4 Every checker needs a negative control
 

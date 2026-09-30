@@ -14,5 +14,10 @@
 // difference, so DESIGN.md and the README both say so rather than letting the
 // demo imply something stronger than it does.
 //
-// Phase 5 fills this package in. It is currently a documented stub.
+// The injected faults are the one piece of state here shared between
+// goroutines, and the one lock: see Transport.mu and DESIGN.md §1.
+//
+// Phase 5 built it. The admin API that lets quorumctl and the visualizer
+// inject faults into a running process is phase 6; until then only in-process
+// tests reach Partition and Heal.
 package grpcx

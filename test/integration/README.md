@@ -1,10 +1,10 @@
 # Integration tests
 
-Reserved for **phase 6**. Currently empty.
-
-This is where the end-to-end fault-injection suite lives: tests that start real
-`quorum-node` processes over real localhost gRPC, then kill, partition, freeze
-and restart them.
+Tests that start real `quorum-node` processes over real localhost gRPC.
+Phase 5 added the first, `TestProcessesServeReadsAndWrites`: it builds the
+binaries, runs a three-process cluster, drives it with the real `quorumctl`,
+and kills every process outright. Phase 6 adds the fault-injection suite that
+kills, partitions, freezes and restarts them.
 
 It is deliberately separate from the fast deterministic suite under
 `internal/testutil/`. That one runs the consensus core in a single-threaded

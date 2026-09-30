@@ -9,7 +9,7 @@ that would fail if the claim were untrue, or says which phase adds that test.
 Where it claims less than the reader might assume, it says so explicitly —
 see [§6, What this will and will not guarantee](#6-what-this-will-and-will-not-guarantee).
 
-**Status:** phase 4 of 8 complete. Sections 1–6 are decided. Where the
+**Status:** phase 5 of 8 complete. Sections 1–6 are decided. Where the
 implementation has since diverged from them, §10 records what changed and why;
 see [PLAN.md](PLAN.md) for the roadmap and [PROGRESS.md](PROGRESS.md) for where
 the work actually is.
@@ -131,15 +131,22 @@ run reproduces from its seed.
 state.** A single driver goroutine owns the `*raft.Node` exclusively and
 serializes every input through one `select`. Ownership replaces locking.
 
-Mutexes and atomics exist in exactly three places, each isolated and each
-documented where it lives:
+Mutexes and atomics exist in exactly two places in production code, each
+isolated and each documented where it lives:
 
-1. `internal/storage` — guards the WAL file handle.
-2. The status snapshot the visualizer reads — an immutable struct published
-   through `atomic.Pointer[Status]`, written by the driver, read lock-free.
+1. The status snapshot the visualizer reads — an immutable struct published
+   through `atomic.Pointer` by the driver loop (`server.Loop`), read lock-free.
    Readers cannot block the consensus loop and cannot corrupt it.
-3. The pending-proposal registry mapping log index → result channel, written by
-   the driver and read by gRPC handler goroutines.
+2. The injected-fault state in `internal/transport/grpcx` — which links are
+   blocked — behind one mutex. It is read by the driver loop as it sends, by
+   every peer goroutine and by every inbound stream handler, and changed by
+   whoever injects the fault.
+
+This list originally had three entries, and different ones; §10, phase 5,
+records the change. The write-ahead log needs no lock because only the driver
+loop touches it. The pending-proposal registry needs none because it lives
+inside the loop too: an RPC handler sends its request on a channel and waits
+for the reply on another, and never touches the registry.
 
 This was chosen over the more common "goroutine per concern plus one big mutex"
 design specifically because the classic failure — *holding the Raft lock across
@@ -597,8 +604,8 @@ quorumctl start <id>            restart against the same data dir   (phase 6)
 quorumctl freeze|thaw <id>      park / resume the event loop        (phase 6)
 quorumctl partition 1,2 | 3     cut links between two groups        (phase 6)
 quorumctl heal                  remove every injected partition     (phase 6)
-quorumctl put <k> <v>           write through the leader            (phase 5)
-quorumctl get <k>               linearizable read via ReadIndex     (phase 5)
+quorumctl put <k> <v>           write through the leader            (works now)
+quorumctl get <k>               linearizable read via ReadIndex     (works now)
 ```
 
 Unimplemented subcommands are recognized, documented, and **exit non-zero**
@@ -702,9 +709,20 @@ be complete, and phase 8 requires it to appear in the README.
 | A snapshot is never acknowledged before it is durable | `TestNoSendBeforeSync` (snapshot variants) | ✅ 4 |
 | That audit can actually fail for snapshots | `TestDurabilityAuditCatchesAnEarlySnapshotAck` | ✅ 4 |
 | The simulator's storage matches the real log through snapshots | `TestWALAgreesWithMemStorageThroughSnapshots` | ✅ 4 |
-| A partitioned leader will not serve a stale read | `TestPartitionedLeaderRefusesRead` | 5 |
-| A retried write applies exactly once | `TestAmbiguousRetryAppliesOnce` | 5 |
-| Client histories are linearizable | `TestLinearizabilityUnderFaults` (Porcupine) | 5 |
+| A real multi-process cluster serves reads and writes, and survives every process being killed | `TestProcessesServeReadsAndWrites` | ✅ 5 |
+| A no-op opens every term, and the leader's commits in its own term | `TestNoopCommittedOnElection` | ✅ 5 |
+| That no-op check can actually fail | `TestNoopCheckCatchesATermWithoutOne` | ✅ 5 |
+| ReadIndex confirms only with a quorum, only after the term's first commit, and abandons reads on step-down | `TestReadIndexWaitsForAQuorum`, `TestReadIndexWaitsForTheTermsFirstCommit`, `TestReadsAreAbandonedOnStepDown` | ✅ 5 |
+| A partitioned leader will not serve a stale read | `TestPartitionedLeaderRefusesRead` | ✅ 5 |
+| That stale-read check can actually fail | `TestStaleReadCheckCatchesAQuorumlessRead` | ✅ 5 |
+| A retried write applies exactly once | `TestAmbiguousRetryAppliesOnce` | ✅ 5 |
+| That applied-once check can actually fail | `TestAppliedOnceCheckCatchesANaiveRetry` | ✅ 5 |
+| A write to a follower is refused, redirected, and costs at most one extra attempt | `TestNotLeaderRedirect` | ✅ 5 |
+| Client histories are linearizable under leader kills and partitions | `TestLinearizabilityUnderFaults` (Porcupine) | ✅ 5 |
+| That linearizability check can actually fail, end to end and on a hand-built history | `TestLinearizabilityCatchesQuorumlessReads`, `TestLinearizabilityCheckerRejectsAStaleRead` | ✅ 5 |
+| Partitions are directed, and heal | `TestPartitionIsDirectedAndHeals` | ✅ 5 |
+| Injecting faults under traffic is race-free | `TestFaultStateIsSafeToChangeUnderTraffic`, under `make race` | ✅ 5 |
+| Every goroutine exits when a node stops | goleak in `internal/node` and `internal/transport/grpcx` | ✅ 5 |
 | Acknowledged writes survive a leader kill | `TestAckedWritesSurviveLeaderKill` | 6 |
 | A killed node recovers from disk | `TestKilledNodeRecovers` | 6 |
 | Random fault schedules stay linearizable | `TestChaosSeeded` | 6 |
@@ -724,6 +742,7 @@ internal/
     grpcx/                real gRPC + fault injection
   pbconv/                 core types <-> protobuf, so raft/ stays protobuf-free
   kvservice/              client gRPC API, ReadIndex, leader redirect
+  node/                   assembles one replica; what quorum-node runs and what in-process tests start
   admin/                  status + fault injection API
   client/                 client library: client_id, seq, retry, redirect
   supervisor/             spawn / kill / restart node processes
@@ -951,3 +970,82 @@ because a snapshot stood in for them, so this is the only check that a snapshot
 carried exactly what the log produced. The simulator's default state machine
 (`testutil.Digest`) is a running hash of everything applied, so the check runs
 in every randomized trial at negligible cost.
+
+### Phase 5
+
+**The synchronization list in §1 changed.** Phase 1 expected three places to
+need a mutex or atomic: the WAL file handle, the status snapshot and the
+pending-proposal registry. Two of those turned out to need none, and a place
+not on the list did. The WAL is touched only by the driver loop. The registry
+lives inside the loop as well: `server.Loop` owns the node, the storage, the
+state machine and every pending request, and a gRPC handler sends its request
+on a channel and waits for the reply on another. The status snapshot is still
+an `atomic.Pointer`. The new one is `grpcx`'s injected-fault state, which
+links are blocked. It is read by the loop as it sends, by every peer goroutine
+and by every inbound stream handler, and changed by whoever injects the fault.
+A channel-only design would need a goroutine owning the fault state and a
+round trip per message sent, to protect two small maps. One mutex, documented
+where it lives, is the honest choice. Its first version had a race, caught by
+the race detector (BUGS.md, 2026-09-30).
+
+**A ReadIndex round is a sequence number in `read_context`.** The field was
+reserved in phase 1 as bytes. The core numbers rounds with a `uint64`, and
+`pbconv` carries it as 8 little-endian bytes. The leader stamps every
+AppendEntries with its latest round. The follower echoes it on its response,
+success **or rejection**: either proves the follower still recognizes this
+leader in this term. A response echoing round s confirms every read registered
+at or before s, so one heartbeat round confirms any number of reads. Reads made
+before the leader's first commit in its term wait for that commit before their
+round starts (§4, step 1). `raft.MutationReadWithoutQuorum` removes the
+confirmation, and it is the negative control for both the stale-read test and
+the linearizability test.
+
+**There is no CheckQuorum, so a partitioned leader keeps believing it leads.**
+It is refused by ReadIndex, which is correct and exactly what
+`TestPartitionedLeaderRefusesRead` requires: its reads time out as `NO_QUORUM`,
+and its writes time out as `TIMEOUT`. The cost is that its unconfirmed reads
+stay queued in the core until it hears a higher term. The loop forgets its own
+waiters once their caller gives up, but the core's queue is bounded only by the
+client request rate over the partition's duration. CheckQuorum, where a leader
+steps down when it has not heard from a majority, would bound it. Like
+pre-vote, it is an availability optimization and not a safety one (§9).
+
+**`ErrLostLeadership` covers two cases.** A pending proposal is answered
+`LOST_LEADERSHIP` when its leader steps down, and also when an entry of a
+different term is applied at its index, meaning ours was overwritten. The
+client cannot tell those apart and does not need to: in both, it retries with
+the same seq, and deduplication settles it.
+
+**A write whose outcome the client never learned can never overtake a later
+one.** The client library returns `ErrUnknownOutcome` when its context expires
+after an ambiguous failure. If that write commits later, after the client has
+moved on to seq+1, the state machine sees a seq at or below `last_seq` and
+treats it as a retry. It is not applied. So an unanswered write takes effect
+before the client's next write or never. The linearizability test models it
+more loosely, as "may take effect at any time after it was invoked". That is
+conservative: it can only make the checker accept more, never reject a correct
+history.
+
+**`internal/node` is new.** It assembles a replica from config: WAL, state
+machine restored from the snapshot, core, loop, transport and KV service on one
+gRPC listener. `cmd/quorum-node` is a thin wrapper around it. The in-process
+tests start the same assembly, so they exercise the wiring the binary ships.
+`Node.Kill` in-process drops the WAL without flushing, which simulates a crash.
+The real-process test, `TestProcessesServeReadsAndWrites`, kills actual
+processes with TerminateProcess/SIGKILL.
+
+**`quorum-node` serves until signalled.** Its phase 1 behaviour, printing its
+configuration and exiting, is now `-describe`, and `make run` uses it.
+
+**Registration is not deduplicated,** and session expiry is not implemented. A
+retried `RegisterClient` may create a second session, which costs a log entry.
+Sessions are never garbage-collected, so `SESSION_EXPIRED` is returned only for
+a client id that was never registered. The exactly-once caveat in §4 about
+expiry therefore does not arise yet.
+
+**The linearizability workload includes a read-only client.** Without one, the
+workload could not produce a stale read from a partitioned leader, even with
+ReadIndex's quorum check removed (BUGS.md, 2026-09-30). Every writer is dragged
+off a cut-off leader within one request timeout, and they all leave at about
+the same moment. A reader stays with the node it believes leads for as long as
+that node answers, as real read-mostly clients do.

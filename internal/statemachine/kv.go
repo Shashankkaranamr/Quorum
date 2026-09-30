@@ -69,6 +69,9 @@ type KV struct {
 
 	// OnApply, if set, is called with the result of every entry applied.
 	OnApply func(Result)
+
+	// last is the result of the most recent ApplyEntry, for LastResult.
+	last Result
 }
 
 // New returns an empty store.
@@ -132,8 +135,15 @@ func (m *KV) ApplyEntry(e raft.Entry) (Result, error) {
 	}
 
 	m.applied = e.Index
+	m.last = res
 	return res, nil
 }
+
+// LastResult is the Result of the most recently applied entry. It implements
+// server.ResultReporter, which is how the driver loop hands each write's
+// outcome to the RPC waiting for it without the loop knowing what a key-value
+// store is.
+func (m *KV) LastResult() any { return m.last }
 
 func (m *KV) applyCommand(idx raft.Index, cmd *kvv1.Command, res *Result) error {
 	res.ClientID, res.Seq = cmd.GetClientId(), cmd.GetSeq()

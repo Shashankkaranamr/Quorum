@@ -19,18 +19,17 @@ write it has already been told succeeded, even if the leader that accepted it
 later dies. This is the same underlying problem etcd solves for Kubernetes'
 cluster state.
 
-> **Status: phase 4 of 8 — Raft elects, replicates, survives restarts and
-> compacts its log.**
+> **Status: phase 5 of 8 — a working, linearizable replicated key-value
+> store.**
 >
-> The consensus core runs in a deterministic simulator that checks Raft's
-> safety properties after every simulated tick. Each node persists to a
-> write-ahead log that recovers cleanly from a crash at any byte. It snapshots
-> its state machine, the key-value store and its client session table, and
-> deletes the log the snapshot supersedes. A node that falls far behind, or
-> loses its data directory, is caught up by snapshot transfer. There is **no
-> network service yet**: no gRPC, no client API, no separate processes. Those
-> are phase 5. The design is in [DESIGN.md](DESIGN.md), the roadmap and
-> acceptance criteria in [PLAN.md](PLAN.md), and what is actually verified in
+> Three `quorum-node` processes serve GET and PUT over gRPC. Reads go through
+> ReadIndex, so a leader cut off from the majority refuses rather than answer
+> stale. Retried writes are applied exactly once. Recorded client histories
+> under leader kills and partitions pass a Porcupine linearizability check.
+> Not built yet: `quorumctl up`, `kill` and `partition` against running
+> processes (phase 6), and the live visualizer (phase 7). The design is in
+> [DESIGN.md](DESIGN.md), the roadmap and acceptance criteria in
+> [PLAN.md](PLAN.md), and what is actually verified in
 > [PROGRESS.md](PROGRESS.md).
 
 ---
@@ -89,6 +88,15 @@ On Windows, where `make` is usually absent, `make.ps1` mirrors every target:
 
 The two are kept in step by a test that fails if either grows a target the other
 does not have.
+
+To run a cluster by hand until `quorumctl up` exists (phase 6), start each node
+in its own terminal and then talk to it:
+
+```bash
+bin/quorum-node -id 1 -config cluster.yaml     # and -id 2, -id 3
+bin/quorumctl put greeting hello
+bin/quorumctl get greeting                      # prints: hello
+```
 
 `make help` lists everything. `make ci` runs what CI runs: format check, lint,
 build, tests and the race detector.

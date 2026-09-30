@@ -13,5 +13,9 @@
 // is safe to retry verbatim. There is no fourth case in which a retry could
 // apply a write twice.
 //
-// Phase 5 fills this package in. It is currently a documented stub.
+// A Client carries one session and one request at a time, because the server's
+// response cache holds one entry per client. Concurrent callers each need
+// their own.
+//
+// Phase 5 built it.
 package client

@@ -94,6 +94,8 @@ func TestMessageRoundTrip(t *testing.T) {
 			PrevLogIndex: 4, PrevLogTerm: 2, Entries: entries, LeaderCommit: 4},
 		{Type: raft.MsgAppendEntries, From: 1, To: 3, Term: 4, PrevLogIndex: 4, PrevLogTerm: 2},
 		{Type: raft.MsgAppendEntriesResp, From: 3, To: 1, Term: 4, Success: true, MatchIndex: 6},
+		{Type: raft.MsgAppendEntries, From: 1, To: 3, Term: 4, PrevLogIndex: 4, PrevLogTerm: 2, ReadSeq: 1 << 40},
+		{Type: raft.MsgAppendEntriesResp, From: 3, To: 1, Term: 4, Success: false, ReadSeq: 7},
 		{Type: raft.MsgAppendEntriesResp, From: 3, To: 1, Term: 4,
 			Success: false, ConflictIndex: 3, ConflictTerm: 1},
 		{Type: raft.MsgInstallSnapshot, From: 1, To: 3, Term: 4,
@@ -129,6 +131,7 @@ func TestMessageRoundTrip(t *testing.T) {
 			require.Equal(t, m.MatchIndex, got.MatchIndex)
 			require.Equal(t, m.ConflictTerm, got.ConflictTerm)
 			require.Equal(t, m.ConflictIndex, got.ConflictIndex)
+			require.Equal(t, m.ReadSeq, got.ReadSeq)
 			require.Equal(t, m.SnapshotMeta, got.SnapshotMeta)
 			require.Equal(t, m.SnapshotOffset, got.SnapshotOffset)
 			require.Equal(t, string(m.SnapshotData), string(got.SnapshotData))

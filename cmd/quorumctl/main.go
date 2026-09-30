@@ -5,13 +5,15 @@
 // suite and the visualizer's buttons both drive the same code underneath, so
 // what the demo shows cannot drift away from what the tests exercise.
 //
-// Phase 1 status: `plan` and `version` work. Every other subcommand is
+// `plan`, `version`, `put` and `get` work. Every other subcommand is
 // recognized, documented, and exits non-zero saying which phase implements it.
 // Failing loudly matters here: a stub that exits 0 would let a broken
 // end-to-end script look green.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -19,8 +21,11 @@ import (
 	"sort"
 	"strings"
 	"text/tabwriter"
+	"time"
 
+	"github.com/Shashankkaranamr/Quorum/internal/client"
 	"github.com/Shashankkaranamr/Quorum/internal/config"
+	"github.com/Shashankkaranamr/Quorum/raft"
 )
 
 var version = "dev"
@@ -47,8 +52,8 @@ var commands = []command{
 	{"thaw", "<id>", "resume a frozen node", 6},
 	{"partition", "<ids> | <ids>", "cut the links between two groups of nodes", 6},
 	{"heal", "", "remove every injected partition", 6},
-	{"put", "<key> <value>", "write through the leader", 5},
-	{"get", "<key>", "linearizable read via ReadIndex", 5},
+	{"put", "[-config F] <key> <value>", "write through the leader", 0},
+	{"get", "[-config F] <key>", "linearizable read via ReadIndex", 0},
 }
 
 func main() {
@@ -97,6 +102,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return nil
 	case "plan":
 		return plan(args[1:], stdout, stderr)
+	case "put", "get":
+		return kv(cmd.name, args[1:], stdout, stderr)
 	default:
 		return errNotYet{cmd}
 	}
@@ -128,7 +135,70 @@ func usage(w io.Writer) {
 		}
 	}
 	_ = tw.Flush()
-	fmt.Fprintf(w, "\nThis is phase 1 of 8. PLAN.md defines what each phase delivers.\n")
+	fmt.Fprintf(w, "\nThis is phase 5 of 8. PLAN.md defines what each phase delivers.\n")
+}
+
+// errNotFound is get's answer for a key that does not exist. It exits non-zero
+// so a script can tell "absent" from "empty value".
+var errNotFound = errors.New("key not found")
+
+// kv runs put or get against the cluster in the config file. Each invocation is
+// a new client session: registering one is a log entry of its own, which is a
+// fine price for a command-line tool and not what a long-lived client does.
+func kv(name string, args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	configPath := fs.String("config", "cluster.yaml", "path to the cluster topology file")
+	timeout := fs.Duration("timeout", 10*time.Second, "give up after this long")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	want := 2
+	if name == "get" {
+		want = 1
+	}
+	if fs.NArg() != want {
+		return fmt.Errorf("%s needs %d argument(s), got %d", name, want, fs.NArg())
+	}
+
+	c, err := config.Load(*configPath)
+	if err != nil {
+		return err
+	}
+	addrs := map[raft.NodeID]string{}
+	for _, n := range c.Nodes {
+		addrs[raft.NodeID(n.ID)] = n.GRPCAddr()
+	}
+	cl, err := client.Dial(client.Config{Addrs: addrs})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = cl.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+	if err := cl.Register(ctx); err != nil {
+		return err
+	}
+
+	key := fs.Arg(0)
+	if name == "put" {
+		res, err := cl.Put(ctx, key, []byte(fs.Arg(1)))
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(stdout, "OK (applied at index %d, via node %d)\n", res.AppliedIndex, cl.Leader())
+		return nil
+	}
+	res, err := cl.Get(ctx, key)
+	if err != nil {
+		return err
+	}
+	if !res.Found {
+		return fmt.Errorf("%q: %w (read at index %d)", key, errNotFound, res.ReadIndex)
+	}
+	fmt.Fprintf(stdout, "%s\n", res.Value)
+	return nil
 }
 
 func plan(args []string, stdout, stderr io.Writer) error {
@@ -165,7 +235,8 @@ func plan(args []string, stdout, stderr io.Writer) error {
 		c.Raft.HeartbeatTimeoutTicks*c.Raft.TickMS,
 		c.Raft.TickMS)
 	fmt.Fprintf(stdout, "\n%s\n", strings.TrimSpace(`
-phase 1 of 8: this prints the plan but does not start anything.
+this prints the plan but does not start anything; start each node with the
+command shown, or wait for "quorumctl up" (phase 6).
 `))
 	return nil
 }

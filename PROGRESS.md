@@ -13,23 +13,23 @@ updated at the end of every phase.
 
 | | |
 |---|---|
-| **Current phase** | **4 of 8 — complete** |
-| **Next phase** | 5 — gRPC KV service, linearizable reads, deduplication |
+| **Current phase** | **5 of 8 — complete** |
+| **Next phase** | 6 — fault-injection suite and bug log |
 | **Last updated** | 2026-09-30 |
 | **Branch** | `main` at `github.com/Shashankkaranamr/Quorum` |
-| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~150s end to end, cold cache) |
-| **Tests** | 100 test and fuzz functions across 8 packages, all passing |
+| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~180s end to end, cold cache) |
+| **Tests** | 121 test and fuzz functions across 11 packages, all passing |
 | **Go** | 1.27.0 |
 
-> **Raft elects, replicates, survives restarts and compacts.** Each node
-> persists to a write-ahead log that recovers from a crash at any byte. Once a
-> threshold of entries has been applied it snapshots its state machine and
-> deletes the log segments the snapshot supersedes. A follower that falls
-> behind the compacted prefix, or loses its data directory, is caught up by a
-> chunked InstallSnapshot. The replicated key-value store and its session table
-> exist and are snapshotted. There is still no network and no gRPC: the driver
-> is stepped by the simulator, and the goroutine loop and client API arrive
-> with phase 5.
+> **A real replicated key-value store.** Three `quorum-node` processes serve
+> linearizable GET and PUT over gRPC. Reads go through ReadIndex, so a leader
+> cut off from the majority refuses to answer rather than answer stale. Writes
+> carry `(client_id, seq)`, so a retry after an ambiguous failure is applied
+> exactly once. `quorumctl put`/`get` work against a real cluster. Recorded
+> histories under leader kills and partitions pass Porcupine's linearizability
+> check. What is missing is the operator's side: `quorumctl up`, `kill` and
+> `partition` against running processes, which need the admin API, and the
+> visualizer. Those are phases 6 and 7.
 
 ---
 
@@ -41,8 +41,8 @@ updated at the end of every phase.
 | 2 | Core consensus: election and log replication | ✅ **complete** |
 | 3 | Crash-safe persistence | ✅ **complete** |
 | 4 | Snapshotting and log compaction | ✅ **complete** |
-| 5 | gRPC KV service, linearizable reads, deduplication | ⬜ next |
-| 6 | Fault-injection suite and bug log | ⬜ not started |
+| 5 | gRPC KV service, linearizable reads, deduplication | ✅ **complete** |
+| 6 | Fault-injection suite and bug log | ⬜ next |
 | 7 | Live cluster visualizer | ⬜ not started |
 | 8 | Integration, documentation and demo | ⬜ not started |
 
@@ -57,21 +57,25 @@ when all of them pass and `make ci` is green.
 
 | Path | State |
 |---|---|
-| `raft/` | **The consensus core.** Leader election with randomized timeouts, log replication with prevLog consistency checks and conflict-term backoff, the Figure 8 commit rule, the Step/Ready protocol, and log compaction: `Node.Compact`, chunked resumable `InstallSnapshot`, Figure 13's install rule. No I/O, no clock, no goroutines, no locks - enforced by `purity_test.go`. |
+| `raft/` | **The consensus core.** Leader election with randomized timeouts, log replication with prevLog consistency checks and conflict-term backoff, the Figure 8 commit rule, the Step/Ready protocol, and log compaction: `Node.Compact`, chunked resumable `InstallSnapshot`, Figure 13's install rule, and ReadIndex. No I/O, no clock, no goroutines, no locks - enforced by `purity_test.go`. |
 | `internal/storage/` | **The durability boundary.** `WAL`: segmented write-ahead log, one CRC-framed record and at most one fsync per Ready, recovery that truncates a torn tail and refuses any other damage, fsync counters and latency in `WALStats`. `SaveSnapshot`: `.snap` file, then a pointer record carrying the log tail and hard state at the head of a fresh segment, then deletion of everything older. Recovery starts from the last pointer. `MemStorage`: the simulator's model of the same contract, sharing the log logic (`logstate.go`) so the two cannot disagree. |
-| `internal/statemachine/` | **The replicated key-value store** with its client session table: put, delete, `(client_id, seq)` deduplication with a cached response, and a deterministic snapshot of data and sessions together. Not yet served over gRPC. |
+| `internal/statemachine/` | **The replicated key-value store** with its client session table: put, delete, `(client_id, seq)` deduplication with a cached response, and a deterministic snapshot of data and sessions together. |
 | `internal/transport/` | `Transport` interface (Send only - see DESIGN.md §10) and `inmem/`, a deterministic bus with drops, delays, duplication, reordering and directed (one-way capable) partitions, all seeded. |
-| `internal/server/` | The driver: the one place Ready ordering is decided (now with a step 0 for an installed snapshot), compaction at a threshold (`SetSnapshotThreshold`, `MaybeSnapshot`), plus the `tick_lag` metrics. Shared by the simulator and, from phase 5, the real goroutine loop. |
+| `internal/transport/grpcx/` | **The real transport**: one client stream per directed link, a goroutine per peer that reconnects with backoff, and directed fault injection (`Partition`, `BlockOutbound`, `BlockInbound`, `Heal`). Its fault state is one of the two synchronized places in production code. |
+| `internal/kvservice/` | **The client KV API**: writes proposed and awaited through the loop, reads through ReadIndex, and the status contract (`NOT_LEADER` with a dialable hint, `LOST_LEADERSHIP`, `TIMEOUT`, `NO_QUORUM`). |
+| `internal/client/` | **The client library**: session registration, per-request seq reused across retries, redirect on hints, `ErrUnknownOutcome` when an ambiguous write runs out of time. |
+| `internal/node/` | **One replica, assembled**: WAL, state machine restored from snapshot, core, loop, transport and KV service on one gRPC listener. What `quorum-node` runs and what the in-process tests start. |
+| `internal/server/` | The driver: the one place Ready ordering is decided, compaction at a threshold, the `tick_lag` metrics, and `Loop`, the goroutine that drives it against the real clock. `Loop` owns the node, storage, state machine and every pending request; handlers reach it through channels only. |
 | `internal/testutil/` | The simulated cluster and the invariant checkers, now compaction-aware and with a seventh invariant, SnapshotFidelity. Storage is pluggable (`MemStorageFactory`, `WALStorageFactory`), and so is the state machine: the default `Digest` is a running hash of everything applied. |
 | `internal/pbconv/` | Core types to protobuf and back, so `raft/` never imports the protobuf runtime. |
 | `internal/config/` | Loads and strictly validates `cluster.yaml`. |
 | `proto/`, `gen/` | Schemas and checked-in generated code. `buf lint` clean. |
-| `cmd/quorum-node`, `cmd/quorumctl` | Minimal but real: parse config, print what they would do, exit 0. Unimplemented subcommands exit non-zero naming their phase. |
+| `cmd/quorum-node` | Serves until SIGINT/SIGTERM. `-describe` prints its configuration and exits (what `make run` uses). |
+| `cmd/quorumctl` | `plan`, `version`, `put`, `get` work. Unimplemented subcommands exit non-zero naming their phase. |
 
 ### Documented stubs (a `doc.go` each, no logic)
 
-`internal/transport/grpcx/` (phase 5) - `internal/kvservice/` (phase 5) - `internal/admin/` (phase 6/7) -
-`internal/client/` (phase 5) - `internal/supervisor/` (phase 6) -
+`internal/admin/` (phase 6/7) - `internal/supervisor/` (phase 6) -
 `cmd/quorum-viz/` (phase 7)
 
 Each `doc.go` states the package's responsibility, the invariants it must
@@ -82,7 +86,7 @@ a package** - it is the spec.
 
 ## What is actually verified
 
-100 test and fuzz functions across 8 packages. What each group proves:
+121 test and fuzz functions across 11 packages. What each group proves:
 
 **The consensus core stays pure** - `raft/purity_test.go`
 
@@ -132,6 +136,27 @@ a package** - it is the spec.
   every committed entry (84 to 116 per run) re-applied identically everywhere.
 - `TestWALAgreesWithMemStorage`: the simulator's crash model and the real log
   agree after reopening.
+
+**The client API, over real gRPC** - `internal/node/`, `test/integration/`, `raft/readindex_test.go`
+
+- `TestProcessesServeReadsAndWrites`: three real processes, the real
+  `quorumctl` put and get, then every process killed with
+  TerminateProcess/SIGKILL and restarted, and the value is still there.
+- `TestPartitionedLeaderRefusesRead`: a leader cut off from the majority, which
+  still believes it leads, answers `NO_QUORUM` after the majority has
+  overwritten the key.
+- `TestAmbiguousRetryAppliesOnce`: the leader applies a write and dies before
+  answering; the retry with the same seq gets `duplicate = true`, and the
+  write was applied exactly once.
+- `TestNotLeaderRedirect`: 2 attempts from a follower, then 1 per write.
+- `TestLinearizabilityUnderFaults`: five clients, one read-only, for 8s of
+  leader kills and partitions. Porcupine finds 5,000 to 10,000 operations per
+  run linearizable.
+- `TestNoopCommittedOnElection`: 387 elected terms in randomized schedules,
+  each opened by a no-op.
+- ReadIndex unit tests: quorum required, the term's first commit awaited,
+  reads abandoned on step-down.
+- goleak on `internal/node` and `grpcx`: no goroutine outlives a stopped node.
 
 **Snapshots and compaction** - `internal/testutil/snapshot_test.go`, `internal/storage/snapshot_test.go`, `internal/statemachine/`, `raft/snapshot_test.go`
 
@@ -192,6 +217,12 @@ Per [CLAUDE.md](CLAUDE.md), a checker nobody has seen fail is not evidence.
 | Snapshot crash check | segments deleted before the pointer was durable (`TestSnapshotCrashCheckCatchesMisorderedWrites`) |
 | Durability audit, snapshots | an acknowledgement sent before its snapshot was durable: *acknowledging index 9 with only 0 entries durable* |
 | Compaction-aware checkers | hand-built violations in logs that start at different indices (`TestCheckerHandlesCompactedLogs`) |
+| Stale-read check | `MutationReadWithoutQuorum`: *the partitioned leader answered k="v1" after the majority wrote v2* |
+| Applied-once check | a naive retry under a new seq: *client 2's write was applied 2 times (and recognized as a retry 0 times)* |
+| Linearizability, end to end | the full workload against `MutationReadWithoutQuorum` must be `Illegal`; its first run was **not**, see BUGS.md |
+| Linearizability model | a hand-built stale read must be `Illegal`, and the corrected history `Ok` |
+| No-op-per-term check | a log where a term opens with a command, including at a snapshot boundary |
+| Fault-state race check | the pre-fix transport under `-race`: six data-race reports |
 
 `TestCheckerAcceptsAHealthyHistory` is the other half for the Raft checkers,
 and the durability audit has its own: a correct Ready spanning two terms must
@@ -247,6 +278,15 @@ form, so nothing gets re-litigated by accident:
   the pointer, then the batch). They are counted apart, in
   `WALStats.SnapshotFsyncs`, so "one fsync per Ready with durable state" still
   holds exactly for `Fsyncs`.
+- **The synchronization list changed in phase 5.** DESIGN.md §1 expected the
+  WAL handle, the status snapshot and the proposal registry to need locks. In
+  the event only the status snapshot does (an atomic pointer), plus the
+  transport's fault state (one mutex). The loop owning every request is what
+  freed the registry. CLAUDE.md §3.3 and DESIGN.md §1 are updated.
+- **`internal/node` was added**, not in the original layout, so the binary and
+  the in-process tests run one assembly.
+- **The linearizability workload has a read-only client** on purpose, and the
+  test comment says why.
 - **`TestWipedNodeCatchesUp` carries a caveat**: a wiped node forgets its vote.
   The test is safe because no election is in progress when it returns. Nothing
   claims wiping is safe in general; DESIGN.md §10.
@@ -255,63 +295,65 @@ form, so nothing gets re-litigated by accident:
 
 ## Open items
 
-Nothing is blocking phase 5. Carried forward:
+Nothing is blocking phase 6. Carried forward:
 
-- **goleak is deferred to phase 5.** Still no goroutines; the first is the
-  driver loop, which needs phase 5's transport.
+- **No CheckQuorum.** A partitioned leader keeps believing it leads. It
+  correctly refuses reads and cannot commit writes, but its unconfirmed reads
+  queue in the core until it hears a higher term. Availability, not safety;
+  DESIGN.md §10.
+- **Session expiry is not implemented.** Sessions are never collected, so
+  `SESSION_EXPIRED` means "never registered". Registration is not
+  deduplicated either; a retried registration costs a log entry.
+- **Faults can only be injected in-process.** The admin API that lets
+  `quorumctl` partition or freeze a running process is phase 6.
+- **`http_port` serves nothing yet.** It is configured and validated for phase
+  7's status endpoint.
 - **Snapshots live in memory.** The core keeps the latest image to send, and a
-  follower builds an incoming one in memory. Fine for a demo-sized store; a
-  large one would stream from the file. DESIGN.md §10.
+  follower builds an incoming one in memory. Fine for a demo-sized store.
 - **The WAL keeps a copy of the log after the snapshot in memory**, which the
-  pointer record needs. Bounded by compaction now.
-- **No compaction margin.** The leader compacts to its applied index, so a
-  follower only slightly behind gets a snapshot rather than a few entries.
+  pointer record needs. Bounded by compaction.
+- **No compaction margin.** A follower only slightly behind gets a snapshot.
   Correct; a throughput tuning, out of scope.
-- **Session expiry is not implemented.** Sessions are never garbage-collected,
-  so `STATUS_SESSION_EXPIRED` is only returned for a client id that was never
-  registered. Phase 5 decides whether to add expiry.
 - **Mid-segment media corruption in the last segment** is indistinguishable
-  from a torn tail and is truncated. Outside the crash-fault model; stated in
-  DESIGN.md §2.
+  from a torn tail and is truncated. Outside the crash-fault model; DESIGN.md
+  §2.
 - **`Mutation` ships in production code** so the negative controls can reach it
   from another package. Fenced by `TestZeroConfigIsUnmutated` and
   `TestEveryMutationIsDistinct`; reasoning in DESIGN.md §10.
-- **The claim-to-test traceability table** (DESIGN.md §7) now has 50 rows
-  filled. Phase 6 requires it complete.
+- **The claim-to-test traceability table** (DESIGN.md §7) now has 64 rows
+  filled. Phase 6 requires every guarantee in §6 to have one.
+- **golangci-lint's first run after a dependency change can exceed its 5m
+  timeout** on a cold cache; the second is seconds. Not a code problem.
 - **No CI runner is configured.** `make ci` passes locally.
 
 ---
 
-## Next: phase 5
+## Next: phase 6
 
-**Goal.** GET and PUT over gRPC that are linearizable, and retries that cannot
-double-apply.
+**Goal.** Every claim about behaviour under failure is backed by a test that
+would fail if the claim were false.
 
 Full acceptance criteria: [PLAN.md](PLAN.md).
 
-What phase 4 left in place:
+What phase 5 left in place:
 
-1. `statemachine.KV` already applies commands, deduplicates by
-   `(client_id, seq)`, and reports each outcome as a `Result` through
-   `OnApply`: `Duplicate`, `AppliedIndex`, `Existed`, `Status`. That is the
-   payload phase 5's pending-proposal registry hands back to a waiting RPC.
-   `statemachine.EncodePut`, `EncodeDelete` and `EncodeRegister` build log
-   payloads.
-2. `server.StateMachine` now includes `Snapshot` and `Restore`, and the driver
-   compacts at a threshold. The real node wires `SetSnapshotThreshold` from
-   `raft.snapshot_threshold_entries` in `cluster.yaml`, and restores the state
-   machine from `storage.Recovered.Snapshot` before building the node, as
-   `testutil.Cluster.newReplica` does.
-3. `pbconv` converts every message type, InstallSnapshot included, so the gRPC
-   transport needs no new conversion code. The 64 KiB default chunk is well
-   under gRPC's 4 MiB default message limit.
+1. `internal/node` runs a full replica; `test/integration` already builds the
+   binaries, writes a config on free ports, starts processes and kills them
+   with `Process.Kill`. `internal/supervisor` can grow out of that code.
+2. `grpcx.Transport` already implements directed partitions and heal. The
+   admin API needs to expose them, and freeze, which parks `server.Loop`,
+   still has to be built.
+3. The Porcupine model, history recorder and read-only-client workload are in
+   `internal/node/linearizability_test.go`. `TestChaosSeeded` needs them
+   against real processes, so they will want to move somewhere shared.
 
 Watch for:
 
-- ReadIndex needs `read_context` carried on AppendEntries and echoed back. The
-  wire format has the field; the core does not use it yet.
-- The single driver goroutine owning `*raft.Node` is the rule (CLAUDE.md
-  §3.3), and a gRPC handler must not call into the core directly.
+- DESIGN.md §6's "Durability of acknowledged writes across process crashes"
+  and "A minority partition cannot commit" both need real-process tests in
+  this phase, not only simulator ones.
+- Freeze is cooperative (CLAUDE.md §8). The admin call must park the loop, and
+  the docs must not call it `SIGSTOP`.
 
 ---
 
@@ -416,3 +458,34 @@ and why it counts for something.
 Verified: `make ci` green, `buf lint` and `buf breaking` clean,
 `make proto-check` clean with `gen/` staged, and every new check observed
 failing on a deliberately broken input.
+
+### Phase 5 - 2026-09-30
+
+Built the client-facing system. ReadIndex went into the core, with
+confirmation rounds carried in the `read_context` field reserved in phase 1.
+Then `server.Loop`, the goroutine driving the core against the real clock and
+owning every pending request. Then the gRPC transport with directed fault
+injection, the KV service, the client library, and `internal/node` to
+assemble a replica. `quorum-node` now serves, and `quorumctl put`/`get` work
+against a real three-process cluster. goleak arrived with the first
+goroutines.
+
+One design change, recorded in DESIGN.md §1 and §10 and in CLAUDE.md §3.3: the
+synchronized places in production code are now the status snapshot and the
+transport's fault state. The proposal registry needed no lock once the loop
+owned it.
+
+Found two real bugs, both in BUGS.md with regression tests observed failing
+first:
+
+- a data race in the transport's fault state, found by `make race`: a map read
+  as a function argument, before the lock that guards it;
+- the linearizability workload could not produce a stale read from a
+  partitioned leader, found by its end-to-end negative control not failing.
+  A read-only client fixed it.
+
+No consensus or storage bug was found; BUGS.md says so and why it counts.
+
+Verified: `make ci` green, `buf lint` and `buf breaking` clean, the real-time
+tests repeated three times under `-race` without a failure, and every new check
+observed failing on a deliberately broken input.

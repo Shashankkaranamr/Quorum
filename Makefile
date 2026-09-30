@@ -82,7 +82,7 @@ ci: fmt-check lint build test race ## Everything CI would run
 run: build ## Show the cluster plan and one node's configuration
 	./$(BIN)/quorumctl plan -config $(CONFIG)
 	@echo
-	./$(BIN)/quorum-node -id 1 -config $(CONFIG)
+	./$(BIN)/quorum-node -id 1 -config $(CONFIG) -describe
 
 up: build ## Start every node in the config as a separate process
 	./$(BIN)/quorumctl up -config $(CONFIG)

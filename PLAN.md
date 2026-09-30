@@ -16,7 +16,7 @@ a later phase is started before that.
 > we actually are** — what is built, what is verified, and what the next concrete
 > steps are. Check it before starting work.
 
-**Current status: phase 4 complete.**
+**Current status: phase 5 complete.**
 
 | Phase | Title | Status |
 |---|---|---|
@@ -24,7 +24,7 @@ a later phase is started before that.
 | 2 | Core consensus: election and log replication | ✅ complete |
 | 3 | Crash-safe persistence | ✅ complete |
 | 4 | Snapshotting and log compaction | ✅ complete |
-| 5 | gRPC KV service, linearizable reads, deduplication | not started |
+| 5 | gRPC KV service, linearizable reads, deduplication | ✅ complete |
 | 6 | Fault-injection suite and bug log | not started |
 | 7 | Live cluster visualizer | not started |
 | 8 | Integration, documentation and demo | not started |
@@ -322,7 +322,7 @@ streamed from disk; see DESIGN.md §10.
 
 ---
 
-## Phase 5 — gRPC KV service, linearizable reads, deduplication
+## Phase 5 — gRPC KV service, linearizable reads, deduplication ✅
 
 **Goal.** GET and PUT over gRPC that are linearizable, and retries that cannot
 double-apply.
@@ -331,27 +331,91 @@ double-apply.
 `internal/transport/grpcx/`, `internal/client/`, real listeners in
 `cmd/quorum-node`, working `quorumctl put`/`get`.
 
+**Delivered.**
+- ReadIndex in the core (`raft/`), with confirmation rounds carried in
+  `read_context`.
+- `server.Loop`, the driver goroutine against the real clock. It owns every
+  pending request, so the proposal registry needs no lock.
+- `grpcx`: one stream per directed link, with directed fault injection.
+- `kvservice`, the client library, and `internal/node`, which assembles a
+  replica.
+- A real `quorum-node` and `quorumctl put`/`get`.
+
+The state machine itself was built in phase 4. Design changes, including the
+revised synchronization list, are in DESIGN.md §10.
+
 **Acceptance criteria**
 
-1. **A real cluster serves reads and writes.** Three separate OS processes over
-   localhost gRPC; `quorumctl put k v` then `quorumctl get k` returns `v`.
-2. **A no-op is committed on every election.** `TestNoopCommittedOnElection`
-   asserts an `ENTRY_TYPE_NOOP` entry at the start of each term. ReadIndex
-   depends on it.
-3. **A partitioned leader will not serve a stale read.** `TestPartitionedLeaderRefusesRead`:
-   partition the leader from the majority, write a new value on the majority
-   side, then read from the old leader. It must return `STATUS_NO_QUORUM` — a
-   successful response with the old value fails the test.
-4. **Retry after an ambiguous failure applies exactly once.**
-   `TestAmbiguousRetryAppliesOnce`: kill the leader after the entry commits but
-   before the response is sent; the client retries with the same `seq`; assert
-   the value was applied once and the response carries `duplicate = true`.
-5. **Redirect is cheap and correct.** `TestNotLeaderRedirect`: a write sent to a
-   follower returns `STATUS_NOT_LEADER` with a usable `leader_hint`, and the
-   client library succeeds in at most 2 attempts in steady state.
-6. **Histories are linearizable.** `TestLinearizabilityUnderFaults`: a
-   concurrent randomized workload recorded as a history and checked with
-   Porcupine, with leader kills and partitions injected during the run.
+1. ✅ **A real cluster serves reads and writes.**
+   `TestProcessesServeReadsAndWrites` (`test/integration/`) builds both
+   binaries and starts three `quorum-node` processes on free localhost ports.
+   The real `quorumctl put k v` then `quorumctl get k` returns `v`, and a
+   missing key exits non-zero. It then kills every process with
+   TerminateProcess/SIGKILL, restarts them from their data directories, and
+   the value is still there.
+2. ✅ **A no-op is committed on every election.** `TestNoopCommittedOnElection`
+   runs 60 randomized simulator schedules with crashes, partitions, loss and
+   compaction, covering 387 elected terms. In every log on every node, the
+   first entry of every term is a no-op, including a term that starts exactly
+   at a snapshot boundary. After the cluster settles, the leader has committed
+   in its own term. Negative control: `TestNoopCheckCatchesATermWithoutOne`.
+   Unit tests pin the mechanics ReadIndex builds on it:
+   `TestReadIndexWaitsForTheTermsFirstCommit`, `TestReadIndexWaitsForAQuorum`
+   and `TestReadsAreAbandonedOnStepDown`.
+3. ✅ **A partitioned leader will not serve a stale read.**
+   `TestPartitionedLeaderRefusesRead`, on real gRPC:
+   - k=v1 is written, then the leader is cut off in both directions.
+   - The majority elects a new leader and writes k=v2.
+   - The test asserts the old leader **still believes it leads**, then reads
+     k from it directly. The answer must be `STATUS_NO_QUORUM`; an OK fails
+     the test.
+
+   Negative control: `TestStaleReadCheckCatchesAQuorumlessRead` runs the same
+   scenario with `MutationReadWithoutQuorum`, and the old leader answers
+   `v1`.
+4. ✅ **Retry after an ambiguous failure applies exactly once.**
+   `TestAmbiguousRetryAppliesOnce`. A fault hook makes the leader apply the Put
+   and then fail the RPC, and the test kills that leader. The client library
+   retries with the same seq, reaches the new leader, and gets `duplicate =
+   true`. The node that answered applied the client's write exactly once.
+   Negative control: `TestAppliedOnceCheckCatchesANaiveRetry` retries under a
+   new seq, and the write is caught being applied twice.
+5. ✅ **Redirect is cheap and correct.** `TestNotLeaderRedirect`. A write to a
+   follower returns `STATUS_NOT_LEADER`, with a hint naming the leader's id and
+   its dialable address, and is not applied. A client whose first guess is a
+   follower needs exactly 2 attempts, then 1 for each of the next 20 writes.
+6. ✅ **Histories are linearizable.** `TestLinearizabilityUnderFaults`:
+   - Five concurrent clients, one of them read-only, work on three keys.
+   - For 8 seconds the leader is repeatedly killed and restarted, or cut off
+     and healed.
+   - Each run records 5,000 to 10,000 operations. Porcupine checks the history
+     against a sequential map and finds it linearizable.
+
+   Negative controls: `TestLinearizabilityCatchesQuorumlessReads` runs the
+   same workload against `MutationReadWithoutQuorum`, and Porcupine must call
+   it illegal. `TestLinearizabilityCheckerRejectsAStaleRead` checks the model
+   on a hand-built history. The end-to-end control first failed to fail,
+   which exposed a blind spot in the workload (BUGS.md, 2026-09-30).
+
+**Also delivered beyond the original criteria**
+
+- goleak on the node and transport packages. Every test fails if a node's
+  loop, its peer goroutines or its gRPC server outlive it. This was deferred
+  from phase 2 until the first goroutine existed.
+- `TestPartitionIsDirectedAndHeals`: a one-way partition cuts one direction
+  only, and healing restores it.
+- `TestFaultStateIsSafeToChangeUnderTraffic`, the regression test for a real
+  data race found by `make race` (BUGS.md, 2026-09-30).
+
+**Not done, and why.**
+- **The admin API**, which lets `quorumctl` and the visualizer inject faults
+  into a running process, is phase 6. Until then only in-process tests call
+  `Partition` and `Heal`.
+- **Session expiry** is not implemented. Sessions are never collected, so the
+  exactly-once caveat about expiry does not arise yet (DESIGN.md §10).
+- **CheckQuorum** is not implemented. A partitioned leader keeps believing it
+  leads, and correctly refuses to serve, but its unconfirmed reads queue in the
+  core until it hears a higher term. That affects availability, not safety.
 
 ---
 

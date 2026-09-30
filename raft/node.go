@@ -1,6 +1,9 @@
 package raft
 
-import "fmt"
+import (
+	"fmt"
+	"slices"
+)
 
 // Node is a Raft replica: a pure state machine.
 //
@@ -65,6 +68,23 @@ type Node struct {
 
 	// incoming accumulates the chunks of a snapshot being received.
 	incoming incomingSnapshot
+
+	// ReadIndex state; see ReadIndex. readSeq numbers confirmation rounds for
+	// this node's lifetime. reads wait for a quorum to echo their round;
+	// unrounded wait for this term's first commit, before which the leader
+	// does not know its commit index. readAcks is each peer's highest echoed
+	// round in the current term.
+	readSeq    uint64
+	reads      []pendingRead
+	unrounded  []uint64
+	readAcks   map[NodeID]uint64
+	readStates []ReadState
+}
+
+type pendingRead struct {
+	id    uint64
+	seq   uint64
+	index Index
 }
 
 // incomingSnapshot is a partially received snapshot. It lives in memory only:
@@ -245,6 +265,7 @@ func (n *Node) send(m Message) {
 }
 
 func (n *Node) becomeFollower(term Term, lead NodeID) {
+	n.abandonReads()
 	if term > n.term {
 		n.term = term
 		n.votedFor = None
@@ -257,6 +278,7 @@ func (n *Node) becomeFollower(term Term, lead NodeID) {
 }
 
 func (n *Node) becomeCandidate() {
+	n.abandonReads()
 	n.term++
 	n.role = Candidate
 	n.lead = None
@@ -270,6 +292,7 @@ func (n *Node) becomeLeader() {
 	n.role = Leader
 	n.lead = n.id
 	n.heartbeatElapsed = 0
+	n.readAcks = make(map[NodeID]uint64, len(n.peers))
 
 	n.progress = make(map[NodeID]*Progress, len(n.peers))
 	next := n.log.lastIndex() + 1
@@ -330,6 +353,7 @@ func (n *Node) HasReady() bool {
 		return false
 	}
 	return len(n.msgs) > 0 ||
+		len(n.readStates) > 0 ||
 		n.pendingSnapshot != nil ||
 		len(n.log.unstableEntries()) > 0 ||
 		len(n.log.nextApplicable()) > 0 ||
@@ -352,7 +376,9 @@ func (n *Node) Ready() Ready {
 		Entries:          n.log.unstableEntries(),
 		Messages:         n.msgs,
 		CommittedEntries: n.log.nextApplicable(),
+		ReadStates:       n.readStates,
 	}
+	n.readStates = nil
 	if hs := n.hardState(); hs != n.prevHardState {
 		copied := hs
 		rd.HardState = &copied
@@ -452,6 +478,94 @@ func (n *Node) Status() Status {
 func (n *Node) LogEntries() []Entry {
 	return append([]Entry(nil), n.log.entries...)
 }
+
+// ReadIndex asks for a linearizable read point (Raft dissertation §6.4). The
+// answer arrives as a ReadState with the same id in a later Ready.
+//
+// The leader records its commit index, then must hear from a quorum -- via
+// responses to AppendEntries sent after the request -- that it is still
+// leader. Only then may the read be served, once the state machine has applied
+// that index. A leader that has been partitioned away cannot collect the
+// quorum, so its reads never confirm; that is the whole point, and it is why a
+// read is never answered from the leader's memory alone.
+//
+// Before a new leader has committed an entry of its own term, its commit index
+// may be behind what earlier leaders committed (§5.4.2). Reads made in that
+// window wait for the term's no-op to commit before their round begins.
+func (n *Node) ReadIndex(id uint64) error {
+	if !n.isLeader() {
+		return ErrNotLeader
+	}
+	for _, r := range n.reads {
+		if r.id == id {
+			return ErrReadIDInUse
+		}
+	}
+	if slices.Contains(n.unrounded, id) {
+		return ErrReadIDInUse
+	}
+	if !n.committedInTerm() {
+		n.unrounded = append(n.unrounded, id)
+		return nil
+	}
+	n.startReadRound(id)
+	return nil
+}
+
+func (n *Node) committedInTerm() bool {
+	t, ok := n.log.term(n.log.committed)
+	return ok && t == n.term
+}
+
+// startReadRound registers reads at the current commit index and sends a round
+// of AppendEntries stamped with a fresh sequence number.
+func (n *Node) startReadRound(ids ...uint64) {
+	if len(ids) == 0 {
+		return
+	}
+	n.readSeq++
+	for _, id := range ids {
+		n.reads = append(n.reads, pendingRead{id: id, seq: n.readSeq, index: n.log.committed})
+	}
+	n.broadcastAppend()
+	n.confirmReads()
+}
+
+// confirmReads releases every read whose round a quorum has echoed. Rounds are
+// numbered in order, so the reads confirm as a prefix.
+func (n *Node) confirmReads() {
+	for len(n.reads) > 0 {
+		r := n.reads[0]
+		acks := 1 // the leader itself
+		for _, p := range n.peers {
+			if p != n.id && n.readAcks[p] >= r.seq {
+				acks++
+			}
+		}
+		if acks < n.cfg.quorum() && n.cfg.UnsafeMutation != MutationReadWithoutQuorum {
+			return
+		}
+		n.readStates = append(n.readStates, ReadState{ID: r.id, Index: r.index})
+		n.reads = n.reads[1:]
+	}
+}
+
+// abandonReads fails every outstanding read when leadership ends. They could
+// still be confirmed by a quorum in principle, but not in a term this node
+// leads, so serving them here could return a stale value.
+func (n *Node) abandonReads() {
+	for _, r := range n.reads {
+		n.readStates = append(n.readStates, ReadState{ID: r.id, Lost: true})
+	}
+	for _, id := range n.unrounded {
+		n.readStates = append(n.readStates, ReadState{ID: id, Lost: true})
+	}
+	n.reads, n.unrounded = nil, nil
+}
+
+// SoftState is the node's volatile role, without Status's allocation. The real
+// driver checks it after every Ready.
+func (n *Node) SoftState() (Role, Term, NodeID) { return n.role, n.term, n.lead }
 
 // Applied is the index of the last entry the state machine has applied, as of
 // the last Advance. It is the highest index Compact will accept.

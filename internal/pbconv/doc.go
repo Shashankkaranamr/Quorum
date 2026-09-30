@@ -10,5 +10,6 @@
 // there is exactly one serialization format to get right and exactly one to
 // fuzz.
 //
-// Phase 2 and phase 3 fill this package in. It is currently a documented stub.
+// Phase 2 built it; phases 4 and 5 added InstallSnapshot and the ReadIndex
+// round carried in read_context.
 package pbconv

@@ -4,21 +4,26 @@
 // data directory and its own ports, and together they form the cluster. They
 // are started, killed and restarted by quorumctl or by the visualizer.
 //
-// Phase 1 status: this binary loads and validates its configuration, reports
-// what it would run as, and exits. The consensus loop arrives in phase 2 and
-// the gRPC listeners in phase 5. It exists now so that `make run` is a real
-// command rather than a placeholder, and so the config contract is exercised
-// end to end from the first commit.
+// It recovers its state from its data directory, then serves the Raft peer
+// transport and the client KV API on its gRPC port until it receives SIGINT or
+// SIGTERM, when it shuts down cleanly. A SIGKILL or TerminateProcess is the
+// crash the write-ahead log exists to survive. -describe prints the node's
+// configuration and exits instead.
 package main
 
 import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
+	"os/signal"
+	"syscall"
 	"text/tabwriter"
 
 	"github.com/Shashankkaranamr/Quorum/internal/config"
+	"github.com/Shashankkaranamr/Quorum/internal/node"
+	"github.com/Shashankkaranamr/Quorum/raft"
 )
 
 // version is overridden at build time via -ldflags.
@@ -38,6 +43,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		configPath  = fs.String("config", "cluster.yaml", "path to the cluster topology file")
 		id          = fs.Uint64("id", 0, "this node's id, as listed in the config file")
 		showVersion = fs.Bool("version", false, "print version and exit")
+		describeCfg = fs.Bool("describe", false, "print this node's configuration and exit")
 	)
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "usage: quorum-node -id <n> [-config cluster.yaml]\n\n")
@@ -71,8 +77,35 @@ func run(args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stderr, "quorum-node: warning: %s\n", w)
 	}
 
-	describe(stdout, cluster, self, *configPath)
-	return nil
+	if *describeCfg {
+		describe(stdout, cluster, self, *configPath)
+		return nil
+	}
+	return serve(cluster, self, stdout, stderr)
+}
+
+// serve runs the node until a shutdown signal, or until it fails on its own --
+// which only a storage failure causes, and which must stop the process rather
+// than let it carry on without a durable log.
+func serve(c *config.Cluster, self config.Node, stdout, stderr io.Writer) error {
+	logger := log.New(stderr, fmt.Sprintf("quorum-node %d: ", self.ID), log.LstdFlags|log.Lmicroseconds)
+	n, err := node.Start(node.Options{Cluster: c, ID: raft.NodeID(self.ID), Logf: logger.Printf})
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "quorum-node %d serving on %s (data %s)\n", self.ID, n.Addr(), c.DataDir(self.ID))
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sig)
+	select {
+	case s := <-sig:
+		logger.Printf("received %v, shutting down", s)
+		return n.Stop()
+	case <-n.Done():
+		err := n.Stop()
+		return fmt.Errorf("the node stopped on its own: %w", err)
+	}
 }
 
 func describe(w io.Writer, c *config.Cluster, self config.Node, configPath string) {
@@ -101,7 +134,6 @@ func describe(w io.Writer, c *config.Cluster, self config.Node, configPath strin
 		r.HeartbeatTimeoutTicks, r.HeartbeatTimeoutTicks*r.TickMS)
 	fmt.Fprintf(tw, "  snapshot after\t%d applied entries\n", r.SnapshotThresholdEntries)
 
-	fmt.Fprintf(tw, "\nphase 1 of 8: configuration validated, consensus not implemented yet.\n")
-	fmt.Fprintf(tw, "See PLAN.md for what each phase delivers.\n")
+	fmt.Fprintf(tw, "\nrun without -describe to start serving.\n")
 	_ = tw.Flush()
 }

@@ -26,5 +26,6 @@
 // A non-leader returns NOT_LEADER together with a leader hint, so the client
 // library can redirect without a full rediscovery round.
 //
-// Phase 5 fills this package in. It is currently a documented stub.
+// Phase 5 built it. Session expiry is not implemented: a session is never
+// garbage-collected (see internal/statemachine).
 package kvservice
