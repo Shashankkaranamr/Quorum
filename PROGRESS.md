@@ -13,23 +13,24 @@ updated at the end of every phase.
 
 | | |
 |---|---|
-| **Current phase** | **5 of 8 — complete** |
-| **Next phase** | 6 — fault-injection suite and bug log |
+| **Current phase** | **6 of 8 — complete** |
+| **Next phase** | 7 — live cluster visualizer |
 | **Last updated** | 2026-09-30 |
 | **Branch** | `main` at `github.com/Shashankkaranamr/Quorum` |
-| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~180s end to end, cold cache) |
-| **Tests** | 121 test and fuzz functions across 11 packages, all passing |
+| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~320s end to end, cold cache) |
+| **Tests** | 140 test and fuzz functions across 12 packages, all passing |
 | **Go** | 1.27.0 |
 
-> **A real replicated key-value store.** Three `quorum-node` processes serve
-> linearizable GET and PUT over gRPC. Reads go through ReadIndex, so a leader
-> cut off from the majority refuses to answer rather than answer stale. Writes
-> carry `(client_id, seq)`, so a retry after an ambiguous failure is applied
-> exactly once. `quorumctl put`/`get` work against a real cluster. Recorded
-> histories under leader kills and partitions pass Porcupine's linearizability
-> check. What is missing is the operator's side: `quorumctl up`, `kill` and
-> `partition` against running processes, which need the admin API, and the
-> visualizer. Those are phases 6 and 7.
+> **A replicated key-value store you can break on purpose.** Three to five
+> `quorum-node` processes serve linearizable GET and PUT over gRPC.
+> `quorumctl up`, `kill`, `start`, `partition` (both ways or one way),
+> `freeze`, `thaw` and `heal` inflict real faults on real processes. A kill is
+> a real TerminateProcess/SIGKILL, confirmed by the PID disappearing. A
+> real-process suite shows that acknowledged writes survive leader kills and
+> rolling restarts, that a minority refuses writes and reconciles exactly, and
+> that seeded chaos stays linearizable. Every guarantee in DESIGN.md §6 names
+> tests, and a tooling test enforces it. What is left is the live visualizer
+> (phase 7) and the final write-up (phase 8).
 
 ---
 
@@ -42,8 +43,8 @@ updated at the end of every phase.
 | 3 | Crash-safe persistence | ✅ **complete** |
 | 4 | Snapshotting and log compaction | ✅ **complete** |
 | 5 | gRPC KV service, linearizable reads, deduplication | ✅ **complete** |
-| 6 | Fault-injection suite and bug log | ⬜ next |
-| 7 | Live cluster visualizer | ⬜ not started |
+| 6 | Fault-injection suite and bug log | ✅ **complete** |
+| 7 | Live cluster visualizer | ⬜ next |
 | 8 | Integration, documentation and demo | ⬜ not started |
 
 Acceptance criteria for each phase are in [PLAN.md](PLAN.md). A phase is done
@@ -70,12 +71,14 @@ when all of them pass and `make ci` is green.
 | `internal/pbconv/` | Core types to protobuf and back, so `raft/` never imports the protobuf runtime. |
 | `internal/config/` | Loads and strictly validates `cluster.yaml`. |
 | `proto/`, `gen/` | Schemas and checked-in generated code. `buf lint` clean. |
+| `internal/supervisor/` | **Real processes**: spawn detached, record PIDs, kill with TerminateProcess/SIGKILL and confirm the PID is gone. Refuses to act on a PID that now belongs to another program (Windows and Linux). |
+| `internal/admin/` | **The Admin API**: status from the loop's published snapshot (so a frozen node still answers), `WatchStatus`, directed `BlockLinks`, `Heal`, `Freeze`/`Thaw`. |
+| `internal/testutil/lincheck/` | The Porcupine model, history recorder and workload, shared by the in-process and real-process linearizability tests. |
 | `cmd/quorum-node` | Serves until SIGINT/SIGTERM. `-describe` prints its configuration and exits (what `make run` uses). |
-| `cmd/quorumctl` | `plan`, `version`, `put`, `get` work. Unimplemented subcommands exit non-zero naming their phase. |
+| `cmd/quorumctl` | Every subcommand works: `plan`, `up`, `down`, `status`, `kill`, `start`, `freeze`, `thaw`, `partition [-oneway]`, `heal`, `put`, `get`. |
 
 ### Documented stubs (a `doc.go` each, no logic)
 
-`internal/admin/` (phase 6/7) - `internal/supervisor/` (phase 6) -
 `cmd/quorum-viz/` (phase 7)
 
 Each `doc.go` states the package's responsibility, the invariants it must
@@ -86,7 +89,7 @@ a package** - it is the spec.
 
 ## What is actually verified
 
-121 test and fuzz functions across 11 packages. What each group proves:
+140 test and fuzz functions across 12 packages. What each group proves:
 
 **The consensus core stays pure** - `raft/purity_test.go`
 
@@ -136,6 +139,26 @@ a package** - it is the spec.
   every committed entry (84 to 116 per run) re-applied identically everywhere.
 - `TestWALAgreesWithMemStorage`: the simulator's crash model and the real log
   agree after reopening.
+
+**Faults on real processes** - `test/integration/`, `internal/supervisor/`, `internal/server/loop_test.go`
+
+- `TestHarnessInflictsRealFaults`: kill (PID gone), restart on the same data,
+  bidirectional and one-way partitions, heal, freeze, thaw and auto-thaw, each
+  checked directly.
+- `TestAckedWritesSurviveLeaderKill`: about 2,000 acknowledged writes, all
+  readable after the leader is killed; new leader in about 200 ms.
+- `TestMinorityPartitionRefusesWrites`: five processes; the minority refuses,
+  the majority commits, and the logs match exactly after healing.
+- `TestRollingRestart`: every node restarted in turn, zero failed operations.
+- `TestChaosSeeded`: kills, isolations, one-way cuts, freezes and leader
+  isolations; 12 seeds in a soak, about 93,000 operations, all linearizable.
+- `TestRestartedFollowerDoesNotDisrupt`, `TestTickLagSeesASlowDisk`: this
+  phase's two bugs, fixed and guarded.
+- `TestQuorumctlDrivesTheCluster`: a whole operator session through the real
+  binary.
+- `TestEveryGuaranteeNamesExistingTests`: DESIGN.md §6 and §7 held to each
+  other.
+- Under `make race`, the node processes run with the race detector too.
 
 **The client API, over real gRPC** - `internal/node/`, `test/integration/`, `raft/readindex_test.go`
 
@@ -223,6 +246,13 @@ Per [CLAUDE.md](CLAUDE.md), a checker nobody has seen fail is not evidence.
 | Linearizability model | a hand-built stale read must be `Illegal`, and the corrected history `Ok` |
 | No-op-per-term check | a log where a term opens with a command, including at a snapshot boundary |
 | Fault-state race check | the pre-fix transport under `-race`: six data-race reports |
+| Acknowledged-writes check | every data directory wiped: *20 of 20 acknowledged writes are missing or wrong* |
+| Log-convergence check | hand-built statuses differing in a middle term, in length, and in commitment |
+| Traceability check | a fixture with a missing guarantee, a row naming no test, and a test that does not exist |
+| PID-ownership check | a PID file naming this test's own live process: ignored, not killed |
+| Kill verification | the PID is asserted alive immediately before the kill |
+| Tick-lag metric | a five-tick fsync must show lag (and a fast disk must not); the pre-fix loop showed 0 |
+| Race scan of node logs | `TestNodesAreRaceCheckedUnderRace`: the node binary really carries `-race` when the tests do |
 
 `TestCheckerAcceptsAHealthyHistory` is the other half for the Raft checkers,
 and the durability audit has its own: a correct Ready spanning two terms must
@@ -283,6 +313,14 @@ form, so nothing gets re-litigated by accident:
   the event only the status snapshot does (an atomic pointer), plus the
   transport's fault state (one mutex). The loop owning every request is what
   freed the registry. CLAUDE.md §3.3 and DESIGN.md §1 are updated.
+- **Phase 6 changed how the real loop counts time**: from the wall clock, not
+  from ticker events, after the tick-lag metric turned out to be blind. And
+  reconnect backoff is capped at one heartbeat in both `grpcx` and gRPC
+  itself. DESIGN.md §10.
+- **`quorumctl down` kills rather than stops gracefully**; Windows has no
+  portable graceful signal, and a kill is what the WAL is built to survive.
+- **Durability across OS crashes is untestable here**, and DESIGN.md §7 says so
+  in the guarantee's own row, naming what the claim rests on instead.
 - **`internal/node` was added**, not in the original layout, so the binary and
   the in-process tests run one assembly.
 - **The linearizability workload has a read-only client** on purpose, and the
@@ -295,65 +333,68 @@ form, so nothing gets re-litigated by accident:
 
 ## Open items
 
-Nothing is blocking phase 6. Carried forward:
+Nothing is blocking phase 7. Carried forward:
 
-- **No CheckQuorum.** A partitioned leader keeps believing it leads. It
-  correctly refuses reads and cannot commit writes, but its unconfirmed reads
-  queue in the core until it hears a higher term. Availability, not safety;
-  DESIGN.md §10.
-- **Session expiry is not implemented.** Sessions are never collected, so
-  `SESSION_EXPIRED` means "never registered". Registration is not
-  deduplicated either; a retried registration costs a log entry.
-- **Faults can only be injected in-process.** The admin API that lets
-  `quorumctl` partition or freeze a running process is phase 6.
-- **`http_port` serves nothing yet.** It is configured and validated for phase
-  7's status endpoint.
-- **Snapshots live in memory.** The core keeps the latest image to send, and a
-  follower builds an incoming one in memory. Fine for a demo-sized store.
-- **The WAL keeps a copy of the log after the snapshot in memory**, which the
-  pointer record needs. Bounded by compaction.
-- **No compaction margin.** A follower only slightly behind gets a snapshot.
-  Correct; a throughput tuning, out of scope.
+- **No CheckQuorum and no pre-vote.** A partitioned leader keeps believing it
+  leads, correctly refusing reads, while its unconfirmed reads queue in the
+  core. A returning node could still disrupt an election if it missed enough
+  heartbeats; phase 6 removed the transport's contribution to that. Both are
+  availability optimizations (DESIGN.md §9, §10).
+- **Session expiry is not implemented.** Sessions are never collected.
+- **PID ownership can only be checked on Windows and Linux.** Elsewhere a stale
+  PID file could name a stranger; DESIGN.md §10.
+- **`http_port` serves nothing yet.** Phase 7.
+- **Snapshots live in memory**, and the WAL keeps the post-snapshot log in
+  memory. Both bounded by compaction; fine for a demo-sized store.
+- **No compaction margin.** A slightly-behind follower gets a snapshot.
 - **Mid-segment media corruption in the last segment** is indistinguishable
-  from a torn tail and is truncated. Outside the crash-fault model; DESIGN.md
-  §2.
-- **`Mutation` ships in production code** so the negative controls can reach it
-  from another package. Fenced by `TestZeroConfigIsUnmutated` and
-  `TestEveryMutationIsDistinct`; reasoning in DESIGN.md §10.
-- **The claim-to-test traceability table** (DESIGN.md §7) now has 64 rows
-  filled. Phase 6 requires every guarantee in §6 to have one.
+  from a torn tail. Outside the crash-fault model; DESIGN.md §2.
+- **`Mutation` ships in production code** for the negative controls; fenced by
+  `TestZeroConfigIsUnmutated` and `TestEveryMutationIsDistinct`.
+- **`make ci` now takes several minutes**, most of it the real-process suite,
+  which runs twice (plain and under `-race`, with race-built nodes).
+  `go test -short ./...` skips it for a quick loop.
 - **golangci-lint's first run after a dependency change can exceed its 5m
-  timeout** on a cold cache; the second is seconds. Not a code problem.
+  timeout** on a cold cache.
+- **One unexplained test failure.** During phase 6, one `make ci` run failed
+  in its race step, and its output was not being captured, so which test
+  failed is unknown. It has not recurred in five further full `-race` runs, a
+  captured `make ci`, and 15 stress runs of the prime suspect
+  (`TestTickLagIsZeroOnAFastDisk`) under parallel load. It is recorded here,
+  rather than dismissed, because an intermittent failure in a consensus
+  project deserves to be found. If it recurs, capture the output (CLAUDE.md §6)
+  and give it a BUGS.md entry.
 - **No CI runner is configured.** `make ci` passes locally.
 
 ---
 
-## Next: phase 6
+## Next: phase 7
 
-**Goal.** Every claim about behaviour under failure is backed by a test that
-would fail if the claim were false.
+**Goal.** Behaviour under failure is something you can watch, not just claim.
 
 Full acceptance criteria: [PLAN.md](PLAN.md).
 
-What phase 5 left in place:
+What phase 6 left in place:
 
-1. `internal/node` runs a full replica; `test/integration` already builds the
-   binaries, writes a config on free ports, starts processes and kills them
-   with `Process.Kill`. `internal/supervisor` can grow out of that code.
-2. `grpcx.Transport` already implements directed partitions and heal. The
-   admin API needs to expose them, and freeze, which parks `server.Loop`,
-   still has to be built.
-3. The Porcupine model, history recorder and read-only-client workload are in
-   `internal/node/linearizability_test.go`. `TestChaosSeeded` needs them
-   against real processes, so they will want to move somewhere shared.
+1. `admin.WatchStatus` streams each node's role, term, indices, peers (with
+   which links are blocked by injection), log tail with summaries, metrics
+   and frozen flag, and keeps streaming while a node is frozen
+   (`TestWatchStatusStreamsLiveState`). The visualizer's backend can fan
+   these in and forward them over SSE.
+2. Every control the UI needs already exists behind a tested path:
+   `supervisor.Kill`/`Start`, and `BlockLinks`/`Heal`/`Freeze`/`Thaw` on the
+   admin API. `cmd/quorumctl/operate.go` shows the calls. Criterion 5 ("the
+   UI cannot corrupt the cluster") holds if the backend uses only these.
+3. `test/integration`'s harness already starts clusters from a generated
+   config at 3 or 5 nodes; phase 7's criterion 6 can reuse it.
 
 Watch for:
 
-- DESIGN.md §6's "Durability of acknowledged writes across process crashes"
-  and "A minority partition cannot commit" both need real-process tests in
-  this phase, not only simulator ones.
-- Freeze is cooperative (CLAUDE.md §8). The admin call must park the loop, and
-  the docs must not call it `SIGSTOP`.
+- `ms_since_last_contact` is only known on the leader (-1 elsewhere), so
+  "unreachable" for the UI should come from the leader's view plus the
+  injected-block flags, and from the supervisor for dead processes.
+- The honesty constraints in CLAUDE.md §8 apply to the UI's labels too: a
+  partition is transport-level, a freeze is cooperative.
 
 ---
 
@@ -489,3 +530,33 @@ No consensus or storage bug was found; BUGS.md says so and why it counts.
 Verified: `make ci` green, `buf lint` and `buf breaking` clean, the real-time
 tests repeated three times under `-race` without a failure, and every new check
 observed failing on a deliberately broken input.
+
+### Phase 6 - 2026-09-30
+
+Built the fault-injection side:
+- the supervisor, with real process kills confirmed by PID absence, and a PID
+  ownership check so a stale PID file cannot get a stranger killed;
+- the Admin API, whose status reads the loop's published snapshot and so works
+  while a node is frozen;
+- cooperative freeze and thaw in the loop, and a real fsync p99;
+- every `quorumctl` operator command;
+- the real-process suite for all seven acceptance criteria, each check with a
+  negative control, including a tooling test that holds DESIGN.md §7 to §6.
+
+Measuring things for this phase found two real bugs, both in BUGS.md with
+regression tests observed failing first:
+
+- **The tick-lag metric was blind in the real loop**, and logical time ran slow
+  under load, because a `time.Ticker` drops ticks its receiver is busy for.
+  Ticks now come from the wall clock.
+- **Restarting any node forced an election.** Two reconnect backoffs, this
+  transport's and gRPC's own default, outlasted the election timeout. Capping
+  only the first changed nothing, which is how the second was found.
+
+No safety violation was found: 12 chaos seeds and about 93,000 operations were
+linearizable, and every acknowledged write survived. Under `make race` the
+node processes now run with the race detector too, and reported no races.
+
+Verified: `make ci` green, every new check observed failing on a deliberately
+broken input, the integration suite repeated three times under `-race`, and the
+12-seed chaos soak.

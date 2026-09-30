@@ -9,7 +9,7 @@ that would fail if the claim were untrue, or says which phase adds that test.
 Where it claims less than the reader might assume, it says so explicitly —
 see [§6, What this will and will not guarantee](#6-what-this-will-and-will-not-guarantee).
 
-**Status:** phase 5 of 8 complete. Sections 1–6 are decided. Where the
+**Status:** phase 6 of 8 complete. Sections 1–6 are decided. Where the
 implementation has since diverged from them, §10 records what changed and why;
 see [PLAN.md](PLAN.md) for the roadmap and [PROGRESS.md](PROGRESS.md) for where
 the work actually is.
@@ -597,13 +597,13 @@ cannot drift from what the tests exercise.
 
 ```
 quorumctl plan                  show what `up` would start          (works now)
-quorumctl up                    start every node as a process       (phase 6)
-quorumctl status                role, term, commit index per node   (phase 6)
-quorumctl kill <id>             TerminateProcess / SIGKILL          (phase 6)
-quorumctl start <id>            restart against the same data dir   (phase 6)
-quorumctl freeze|thaw <id>      park / resume the event loop        (phase 6)
-quorumctl partition 1,2 | 3     cut links between two groups        (phase 6)
-quorumctl heal                  remove every injected partition     (phase 6)
+quorumctl up                    start every node as a process       (works now)
+quorumctl status                role, term, commit index per node   (works now)
+quorumctl kill <id>             TerminateProcess / SIGKILL          (works now)
+quorumctl start <id>            restart against the same data dir   (works now)
+quorumctl freeze|thaw <id>      park / resume the event loop        (works now)
+quorumctl partition 1,2 '|' 3   cut links between two groups        (works now)
+quorumctl heal                  remove every injected partition     (works now)
 quorumctl put <k> <v>           write through the leader            (works now)
 quorumctl get <k>               linearizable read via ReadIndex     (works now)
 ```
@@ -654,8 +654,21 @@ end-to-end script look green.
 ## 7. Claim-to-test traceability
 
 Every guarantee in §6 must name a test that would fail if the guarantee were
-false. The table is filled in as the tests are written; phase 6 requires it to
-be complete, and phase 8 requires it to appear in the README.
+false. `TestEveryGuaranteeNamesExistingTests` (test/tooling) holds this section
+to that: every guarantee in §6 must have a row in the first table below, and
+every test named anywhere in this section must exist in the repository.
+
+### The guarantees in §6
+
+| Guarantee | Tests |
+|---|---|
+| Linearizable single-key reads and writes | `TestLinearizabilityUnderFaults`, `TestChaosSeeded` (Porcupine over histories recorded under kills, partitions, one-way cuts and freezes), `TestPartitionedLeaderRefusesRead` |
+| At-most-once application of client commands | `TestAmbiguousRetryAppliesOnce`, `TestSessionsSurviveSnapshot` |
+| Durability of acknowledged writes | Process crashes: `TestAckedWritesSurviveLeaderKill`, `TestRollingRestart`, `TestProcessesServeReadsAndWrites` and `TestKilledNodeRecovers`, all killing real processes; `TestClusterRestartRecoversCommitted` and `TestWALTruncationAtEveryOffset` on the recovery path. **OS crashes are not tested**: the suite cannot crash the operating system. That half of the claim rests on nothing being acknowledged before it is fsynced (`TestNoSendBeforeSync`, `TestOneFsyncPerReady`) and on the OS honouring `fsync`/`FlushFileBuffers`, whose limits §2 states. |
+| No committed entry is lost, reordered, or overwritten | `CommittedEntriesAreStable`, `StateMachineSafety`, `LogMatching` and `SnapshotFidelity` checked after every tick by `TestRandomizedTrialsUpholdSafety`, `TestRandomizedTrialsUpholdSafetyOnDisk` and `TestRandomizedTrialsUpholdSafetyWithSnapshots`; `TestMinorityPartitionRefusesWrites` on real processes |
+| A minority partition cannot commit anything. | `TestMinorityPartitionCannotCommit` (simulator), `TestMinorityPartitionRefusesWrites` (five real processes) |
+
+### Every claim, and the test behind it
 
 | Claim | Test | Phase |
 |---|---|---|
@@ -723,9 +736,17 @@ be complete, and phase 8 requires it to appear in the README.
 | Partitions are directed, and heal | `TestPartitionIsDirectedAndHeals` | ✅ 5 |
 | Injecting faults under traffic is race-free | `TestFaultStateIsSafeToChangeUnderTraffic`, under `make race` | ✅ 5 |
 | Every goroutine exits when a node stops | goleak in `internal/node` and `internal/transport/grpcx` | ✅ 5 |
-| Acknowledged writes survive a leader kill | `TestAckedWritesSurviveLeaderKill` | 6 |
-| A killed node recovers from disk | `TestKilledNodeRecovers` | 6 |
-| Random fault schedules stay linearizable | `TestChaosSeeded` | 6 |
+| The harness really kills (PID gone), restarts on the same data, partitions both ways and one way, heals, freezes and thaws | `TestHarnessInflictsRealFaults` | ✅ 6 |
+| quorumctl drives every operation end to end | `TestQuorumctlDrivesTheCluster` | ✅ 6 |
+| Acknowledged writes survive a leader kill, and a new leader appears within a bound | `TestAckedWritesSurviveLeaderKill` | ✅ 6 |
+| That acknowledged-writes check can actually fail | `TestAckedCheckCatchesLostData` | ✅ 6 |
+| A killed node recovers from disk | `TestKilledNodeRecovers` | ✅ 6 |
+| A minority refuses writes, the majority continues, and healing reconciles the logs exactly | `TestMinorityPartitionRefusesWrites` | ✅ 6 |
+| That log-convergence check can actually fail | `TestLogMatchCheckCatchesDivergence` | ✅ 6 |
+| A rolling restart loses nothing and serves throughout | `TestRollingRestart` | ✅ 6 |
+| Random fault schedules stay linearizable | `TestChaosSeeded` | ✅ 6 |
+| A recorded PID is never acted on once it belongs to another program | `TestSupervisorIgnoresAStrangersPID` | ✅ 6 |
+| This traceability section names only tests that exist, and covers every guarantee | `TestEveryGuaranteeNamesExistingTests`, `TestTraceabilityCheckCatchesGaps` | ✅ 6 |
 
 ---
 
@@ -1049,3 +1070,70 @@ ReadIndex's quorum check removed (BUGS.md, 2026-09-30). Every writer is dragged
 off a cut-off leader within one request timeout, and they all leave at about
 the same moment. A reader stays with the node it believes leads for as long as
 that node answers, as real read-mostly clients do.
+
+### Phase 6
+
+**Logical time in the real loop comes from the wall clock.** §1 says a slow
+fsync delays ticks and that the delay is measured. The loop as first written
+counted one tick per `time.Ticker` event. A ticker drops the ticks its
+receiver is too busy to take, so the measured lag was structurally zero, and
+logical time ran slow whenever the loop was busy. The ticker now only wakes
+the loop. The ticks due are counted from the clock and delivered, so a stall
+shows up both as lag and as timers catching up, as the simulator always
+modelled it. Time spent frozen is deliberately not replayed. BUGS.md,
+2026-09-30.
+
+**Reconnect backoff is bounded by the heartbeat interval, in both layers.** A
+restarted node that hears nothing for an election timeout campaigns and
+deposes a healthy leader. `grpcx`'s own reconnect backoff and gRPC's internal
+redial schedule (1 s rising to two minutes by default) both exceeded the
+election timeout, so every restart cost an election. Both are now capped at
+one heartbeat interval. §5's validation keeps that under a third of the
+election timeout. Pre-vote (§9) remains the protocol-level defence; this
+removes the trigger. BUGS.md, 2026-09-30.
+
+**The supervisor records PIDs and checks who owns them.** Each node's PID is
+written to `node.pid` in its data directory, so one `quorumctl` can kill what
+another started. Operating systems reuse PIDs. Before acting on a recorded
+PID, the supervisor checks the process is still running the `quorum-node`
+binary it started, through `QueryFullProcessImageName` on Windows and
+`/proc/<pid>/exe` on Linux. On other platforms that check is unavailable, and
+a stale PID file could in principle name a stranger;
+`TestSupervisorIgnoresAStrangersPID` is skipped there. A kill is not reported
+until the operating system says the process is gone.
+
+**`quorumctl down` kills.** Windows has no portable way to ask another process
+to shut down cleanly, and a kill is exactly what the write-ahead log exists to
+survive. So `down` is a real kill on every platform, and its help text says so.
+
+**Nodes started by `up` are detached** into their own process group (Windows)
+or session (Unix). They outlive the `quorumctl` that started them and do not
+receive its terminal's Ctrl+C.
+
+**Admin status never goes through the loop.** It is read from the snapshot the
+loop publishes, so a frozen node still answers `GetStatus`, which is when it
+matters most. `tick_lag_ticks` reports the worst lag seen: at the instant the
+snapshot is published, the loop has just caught up, so the current backlog is
+zero by construction. `ms_since_last_contact` is known only on a leader, which
+hears from every peer; elsewhere it is -1, and "reachable" means only "not
+blocked by injection". `fsync_p99_micros` now exists: the WAL keeps the last
+512 per-Ready fsync latencies.
+
+**Under `make race`, the nodes run under the race detector too.** The
+integration tests build `quorum-node` with `-race` when they themselves run
+with it, and fail any test whose node logs contain a race report.
+`TestNodesAreRaceCheckedUnderRace` checks the binary's build flags, so the log
+scan cannot pass merely because nothing was instrumented.
+
+**"Reproducible from its seed" means the schedule, not the interleaving.**
+`TestChaosSeeded`'s seed fixes every fault, target, duration and client
+operation sequence. It cannot fix how real processes interleave on a real
+clock. A failing seed replays the same attack, not the same history, so the
+test logs the schedule. `QUORUM_CHAOS_SEED` reruns one seed and
+`QUORUM_CHAOS_ITERATIONS` runs a longer soak.
+
+**The guarantees table is enforced.** §7 now opens with a table mapping each
+§6 guarantee to its tests, and `TestEveryGuaranteeNamesExistingTests` fails if
+a guarantee lacks a row or a named test does not exist. Durability across
+**OS** crashes is the one half-claim no test here can exercise, and its row
+says so rather than implying otherwise.

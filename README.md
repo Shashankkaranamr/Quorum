@@ -19,18 +19,18 @@ write it has already been told succeeded, even if the leader that accepted it
 later dies. This is the same underlying problem etcd solves for Kubernetes'
 cluster state.
 
-> **Status: phase 5 of 8 — a working, linearizable replicated key-value
-> store.**
+> **Status: phase 6 of 8 — a linearizable replicated key-value store you can
+> break on purpose.**
 >
-> Three `quorum-node` processes serve GET and PUT over gRPC. Reads go through
-> ReadIndex, so a leader cut off from the majority refuses rather than answer
-> stale. Retried writes are applied exactly once. Recorded client histories
-> under leader kills and partitions pass a Porcupine linearizability check.
-> Not built yet: `quorumctl up`, `kill` and `partition` against running
-> processes (phase 6), and the live visualizer (phase 7). The design is in
-> [DESIGN.md](DESIGN.md), the roadmap and acceptance criteria in
-> [PLAN.md](PLAN.md), and what is actually verified in
-> [PROGRESS.md](PROGRESS.md).
+> Real `quorum-node` processes serve GET and PUT over gRPC. `quorumctl` starts
+> them, kills them (a real TerminateProcess/SIGKILL), partitions them both ways
+> or one way, freezes and heals them. A real-process test suite shows:
+> acknowledged writes survive leader kills and rolling restarts; a minority
+> refuses writes and reconciles exactly after healing; randomized fault
+> schedules stay linearizable under Porcupine. Not built yet: the live
+> visualizer (phase 7). The design is in [DESIGN.md](DESIGN.md), the roadmap
+> and acceptance criteria in [PLAN.md](PLAN.md), what is actually verified in
+> [PROGRESS.md](PROGRESS.md), and every bug testing found in [BUGS.md](BUGS.md).
 
 ---
 
@@ -89,13 +89,18 @@ On Windows, where `make` is usually absent, `make.ps1` mirrors every target:
 The two are kept in step by a test that fails if either grows a target the other
 does not have.
 
-To run a cluster by hand until `quorumctl up` exists (phase 6), start each node
-in its own terminal and then talk to it:
+To run a cluster and break it:
 
 ```bash
-bin/quorum-node -id 1 -config cluster.yaml     # and -id 2, -id 3
+bin/quorumctl up                      # start every node in cluster.yaml
 bin/quorumctl put greeting hello
-bin/quorumctl get greeting                      # prints: hello
+bin/quorumctl get greeting            # prints: hello
+bin/quorumctl status                  # role, term, commit index per node
+bin/quorumctl kill 1                  # a real TerminateProcess / SIGKILL
+bin/quorumctl partition 2 '|' 3       # cut links (transport-level, not a firewall)
+bin/quorumctl freeze 3                # park node 3's loop (cooperative, not SIGSTOP)
+bin/quorumctl heal
+bin/quorumctl down                    # kill every node
 ```
 
 `make help` lists everything. `make ci` runs what CI runs: format check, lint,

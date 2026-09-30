@@ -178,6 +178,9 @@ type WAL struct {
 	recovery WALRecovery
 	stats    WALStats
 
+	// recent is a ring of the latest per-Ready fsync latencies, for FsyncP99.
+	recent [fsyncWindow]time.Duration
+
 	// failed is set on the first write or fsync error and returned from
 	// every call after it.
 	failed error
@@ -628,6 +631,7 @@ func (w *WAL) Sync() error {
 		return err
 	}
 
+	w.recent[w.stats.Fsyncs%fsyncWindow] = elapsed
 	w.stats.Fsyncs++
 	w.stats.FsyncTotal += elapsed
 	w.stats.FsyncMax = max(w.stats.FsyncMax, elapsed)
@@ -796,6 +800,24 @@ func (w *WAL) roll() error {
 // was opened, or what has been written since.
 func (w *WAL) InitialState() (Recovered, error) {
 	return Recovered{HardState: w.hs, Snapshot: w.snap, Entries: w.log.clone().entries}, nil
+}
+
+// fsyncWindow is how many recent fsyncs FsyncP99 looks at. Recent rather than
+// lifetime, because the question it answers is "is the disk slow now", which
+// is what tells a slow disk apart from a stalled loop.
+const fsyncWindow = 512
+
+// FsyncP99 is the 99th-percentile latency of the most recent per-Ready fsyncs,
+// or zero if there have been none. It sorts a copy of the window, so it is
+// meant for a status display a few times a second, not for every Ready.
+func (w *WAL) FsyncP99() time.Duration {
+	n := int(min(w.stats.Fsyncs, fsyncWindow))
+	if n == 0 {
+		return 0
+	}
+	window := slices.Clone(w.recent[:n])
+	slices.Sort(window)
+	return window[(n*99-1)/100]
 }
 
 // Recovery reports what Open found on disk.

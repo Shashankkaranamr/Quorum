@@ -11,5 +11,9 @@
 // Restart respawns against the same data directory, so recovery reads the real
 // write-ahead log rather than a fixture.
 //
-// Phase 6 fills this package in. It is currently a documented stub.
+// PIDs are recorded in each node's data directory so separate quorumctl
+// invocations can find them, and are checked against the quorum-node binary
+// before being acted on, because operating systems reuse PIDs. See Supervisor.
+//
+// Phase 6 built it.
 package supervisor

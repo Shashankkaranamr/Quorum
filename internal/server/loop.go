@@ -65,6 +65,46 @@ type LoopOptions struct {
 	// Logf reports conditions worth a human's attention -- a message the core
 	// rejected, the loop stopping on a storage failure. Nil discards them.
 	Logf func(format string, args ...any)
+
+	// LogTail is how many recent log entries each published snapshot carries,
+	// for status displays. Zero means 32.
+	LogTail int
+}
+
+// Snapshot is what the loop publishes after every iteration: everything an
+// observer may want, captured at one instant, never modified afterwards. That
+// last property is what makes reading it from another goroutine, without a
+// lock, safe.
+type Snapshot struct {
+	Status  raft.Status
+	Metrics Metrics
+	LogTail []raft.Entry
+
+	// Frozen is true while the loop is parked by Freeze.
+	Frozen bool
+
+	MessagesReceived  uint64
+	ProposalsAccepted uint64
+	ProposalsRejected uint64
+
+	// Fsyncs and FsyncP99 come from the storage, when it reports them.
+	Fsyncs   uint64
+	FsyncP99 time.Duration
+
+	PublishedAt time.Time
+}
+
+// StorageStats is storage that reports its fsync behaviour. The write-ahead
+// log does.
+type StorageStats interface {
+	Stats() storage.WALStats
+	FsyncP99() time.Duration
+}
+
+// ThawReport says what a freeze cost.
+type ThawReport struct {
+	FrozenFor   time.Duration
+	TicksMissed uint64
 }
 
 // Loop drives a raft.Node from one goroutine against the real clock.
@@ -88,11 +128,13 @@ type Loop struct {
 
 	proposals chan *proposeReq
 	reads     chan *readReq
+	control   chan controlReq
 	stop      chan struct{}
 	done      chan struct{}
 	err       error // written by the loop before done closes
 
-	status atomic.Pointer[loopStatus]
+	status atomic.Pointer[Snapshot]
+	store  storage.Storage
 
 	// Owned by the loop goroutine.
 	pending    map[raft.Index]*proposeReq
@@ -101,6 +143,18 @@ type Loop struct {
 	nextReadID uint64
 	wasLeader  bool
 	leaderTerm raft.Term
+
+	received, accepted, rejected uint64
+	p99                          time.Duration
+	p99At                        time.Time
+	frozen                       bool
+}
+
+// controlReq asks the loop to freeze (freeze true) or thaw.
+type controlReq struct {
+	freeze   bool
+	autoThaw time.Duration
+	reply    chan ThawReport
 }
 
 type proposeReq struct {
@@ -136,11 +190,16 @@ func NewLoop(node *raft.Node, store storage.Storage, trans transport.Transport, 
 	if opts.Tick <= 0 {
 		opts.Tick = 50 * time.Millisecond
 	}
+	if opts.LogTail <= 0 {
+		opts.LogTail = 32
+	}
 	l := &Loop{
 		inbound:   inbound,
 		opts:      opts,
 		proposals: make(chan *proposeReq),
 		reads:     make(chan *readReq),
+		control:   make(chan controlReq),
+		store:     store,
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 		pending:   map[raft.Index]*proposeReq{},
@@ -201,10 +260,94 @@ func (l *Loop) Read(ctx context.Context, fn func() any) (raft.Index, any, error)
 }
 
 // Status is the node's state as of the loop's last iteration. It never blocks.
-func (l *Loop) Status() raft.Status { return l.status.Load().status }
+func (l *Loop) Status() raft.Status { return l.status.Load().Status }
 
 // Metrics is the driver's counters as of the loop's last iteration.
-func (l *Loop) Metrics() Metrics { return l.status.Load().metrics }
+func (l *Loop) Metrics() Metrics { return l.status.Load().Metrics }
+
+// Snapshot is everything published by the loop's last iteration. It never
+// blocks, including while the loop is frozen.
+func (l *Loop) Snapshot() Snapshot { return *l.status.Load() }
+
+// Freeze parks the loop: no ticks, no messages, no requests are processed
+// until Thaw, or until autoThaw passes if it is non-zero. The process stays up
+// and its listener keeps accepting; requests simply wait, and inbound messages
+// back up and are dropped, as they would for a process that stopped being
+// scheduled. It is cooperative -- the loop parks itself -- which is the honest
+// way to describe it: it is not SIGSTOP.
+//
+// It returns once the loop is parked. Freezing a frozen loop does nothing.
+func (l *Loop) Freeze(ctx context.Context, autoThaw time.Duration) error {
+	_, err := l.sendControl(ctx, controlReq{freeze: true, autoThaw: autoThaw})
+	return err
+}
+
+// Thaw resumes a frozen loop and reports how long it was parked and how many
+// ticks it missed. The missed ticks are not replayed: a process that was not
+// scheduled did not see that time pass either, and replaying it would fire
+// every timer at once.
+func (l *Loop) Thaw(ctx context.Context) (ThawReport, error) {
+	return l.sendControl(ctx, controlReq{})
+}
+
+func (l *Loop) sendControl(ctx context.Context, c controlReq) (ThawReport, error) {
+	c.reply = make(chan ThawReport, 1)
+	select {
+	case l.control <- c:
+	case <-ctx.Done():
+		return ThawReport{}, ctx.Err()
+	case <-l.done:
+		return ThawReport{}, ErrStopped
+	}
+	select {
+	case r := <-c.reply:
+		return r, nil
+	case <-ctx.Done():
+		return ThawReport{}, ctx.Err()
+	case <-l.done:
+		return ThawReport{}, ErrStopped
+	}
+}
+
+// park is the frozen state. It returns false if the loop was told to stop
+// while frozen.
+func (l *Loop) park(req controlReq, ticker *time.Ticker) bool {
+	start := time.Now()
+	var missed uint64
+	var auto <-chan time.Time
+	if req.autoThaw > 0 {
+		timer := time.NewTimer(req.autoThaw)
+		defer timer.Stop()
+		auto = timer.C
+	}
+	l.frozen = true
+	l.publish()
+	req.reply <- ThawReport{}
+	defer func() {
+		l.frozen = false
+		l.publish()
+	}()
+	for {
+		select {
+		case <-l.stop:
+			return false
+		case <-ticker.C:
+			missed++
+		case <-auto:
+			l.logf("auto-thawed after %s, %d ticks missed", time.Since(start), missed)
+			return true
+		case c := <-l.control:
+			report := ThawReport{FrozenFor: time.Since(start), TicksMissed: missed}
+			if c.freeze {
+				// Already frozen: acknowledge and stay parked.
+				c.reply <- ThawReport{}
+				continue
+			}
+			c.reply <- report
+			return true
+		}
+	}
+}
 
 // Done is closed when the loop has exited.
 func (l *Loop) Done() <-chan struct{} { return l.done }
@@ -243,12 +386,23 @@ func (l *Loop) run() {
 	ticker := time.NewTicker(l.opts.Tick)
 	defer ticker.Stop()
 
+	// next is when the next logical tick falls due. Ticks are counted from
+	// the wall clock, not from ticker events: a time.Ticker drops the ticks
+	// its receiver is too busy to take, so after a slow fsync it delivers
+	// one tick however many were missed. Counting from the ticker made the
+	// tick-lag metric structurally zero, and made the core's clock run slow
+	// whenever the loop was busy (BUGS.md, 2026-09-30). The ticker only wakes
+	// the loop; the clock decides how many ticks that is.
+	next := time.Now().Add(l.opts.Tick)
+
 	for {
 		select {
 		case <-l.stop:
 			return
 		case <-ticker.C:
-			l.d.Tick()
+			for now := time.Now(); !next.After(now); next = next.Add(l.opts.Tick) {
+				l.d.Tick()
+			}
 			l.sweepAbandoned()
 		case m := <-l.inbound:
 			l.step(m)
@@ -265,6 +419,16 @@ func (l *Loop) run() {
 			l.propose(p)
 		case r := <-l.reads:
 			l.read(r)
+		case c := <-l.control:
+			if !c.freeze {
+				c.reply <- ThawReport{} // not frozen; nothing to thaw
+				continue
+			}
+			if !l.park(c, ticker) {
+				return
+			}
+			// Time spent frozen is deliberately not replayed; see Thaw.
+			next = time.Now().Add(l.opts.Tick)
 		}
 
 		if err := l.process(); err != nil {
@@ -276,6 +440,7 @@ func (l *Loop) run() {
 }
 
 func (l *Loop) step(m raft.Message) {
+	l.received++
 	if err := l.d.Step(m); err != nil {
 		l.logf("rejected %s: %v", m, err)
 	}
@@ -284,10 +449,12 @@ func (l *Loop) step(m raft.Message) {
 func (l *Loop) propose(p *proposeReq) {
 	idx, term, err := l.d.Propose(p.typ, p.data)
 	if err != nil {
+		l.rejected++
 		_, _, lead := l.d.node.SoftState()
 		p.reply <- proposeReply{err: NotLeaderError{Leader: lead}}
 		return
 	}
+	l.accepted++
 	p.term = term
 	l.pending[idx] = p
 }
@@ -413,16 +580,31 @@ func (l *Loop) failAll(err error) {
 	l.confirmed = nil
 }
 
-// loopStatus is what the loop publishes: the node's status and the driver's
-// counters, captured at the same instant. It is never modified after it is
-// stored, which is what makes reading it without a lock safe.
-type loopStatus struct {
-	status  raft.Status
-	metrics Metrics
-}
+// p99Every bounds how often the loop recomputes the fsync percentile, which
+// sorts a window of latencies: often enough for a display, rarely enough to
+// cost the loop nothing measurable.
+const p99Every = 250 * time.Millisecond
 
 func (l *Loop) publish() {
-	l.status.Store(&loopStatus{status: l.d.node.Status(), metrics: l.d.Metrics()})
+	now := time.Now()
+	s := &Snapshot{
+		Status:            l.d.node.Status(),
+		Metrics:           l.d.Metrics(),
+		LogTail:           l.d.node.LogTail(l.opts.LogTail),
+		Frozen:            l.frozen,
+		MessagesReceived:  l.received,
+		ProposalsAccepted: l.accepted,
+		ProposalsRejected: l.rejected,
+		PublishedAt:       now,
+	}
+	if st, ok := l.store.(StorageStats); ok {
+		s.Fsyncs = st.Stats().Fsyncs
+		if now.Sub(l.p99At) >= p99Every {
+			l.p99, l.p99At = st.FsyncP99(), now
+		}
+		s.FsyncP99 = l.p99
+	}
+	l.status.Store(s)
 }
 
 // resolvingSM applies entries one at a time so each one's result can be handed

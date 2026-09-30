@@ -79,6 +79,8 @@ type Node struct {
 	unrounded  []uint64
 	readAcks   map[NodeID]uint64
 	readStates []ReadState
+
+	electionsStarted uint64
 }
 
 type pendingRead struct {
@@ -155,6 +157,11 @@ func (n *Node) resetElectionTimer() {
 // This is the only way time moves. There is no clock in this package.
 func (n *Node) Tick() {
 	if n.isLeader() {
+		for id, pr := range n.progress {
+			if id != n.id {
+				pr.TicksSinceContact++
+			}
+		}
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.cfg.HeartbeatTimeoutTicks {
 			n.heartbeatElapsed = 0
@@ -313,6 +320,7 @@ func (n *Node) becomeLeader() {
 
 // campaign starts an election.
 func (n *Node) campaign() {
+	n.electionsStarted++
 	n.becomeCandidate()
 
 	// A single-node cluster wins immediately; there is nobody to ask.
@@ -444,21 +452,22 @@ func (n *Node) updateSelfProgress() {
 // Status returns an immutable snapshot of observable state.
 func (n *Node) Status() Status {
 	s := Status{
-		ID:              n.id,
-		Role:            n.role,
-		Term:            n.term,
-		VotedFor:        n.votedFor,
-		Leader:          n.lead,
-		CommitIndex:     n.log.committed,
-		LastApplied:     n.log.applied,
-		LastLogIndex:    n.log.lastIndex(),
-		LastLogTerm:     n.log.lastTerm(),
-		StableIndex:     n.log.stable,
-		SnapshotIndex:   n.log.snapIndex,
-		SnapshotTerm:    n.log.snapTerm,
-		LogRevision:     n.log.revision,
-		ElectionElapsed: n.electionElapsed,
-		ElectionTimeout: n.electionTimeout,
+		ID:               n.id,
+		Role:             n.role,
+		Term:             n.term,
+		VotedFor:         n.votedFor,
+		Leader:           n.lead,
+		CommitIndex:      n.log.committed,
+		LastApplied:      n.log.applied,
+		LastLogIndex:     n.log.lastIndex(),
+		LastLogTerm:      n.log.lastTerm(),
+		StableIndex:      n.log.stable,
+		SnapshotIndex:    n.log.snapIndex,
+		SnapshotTerm:     n.log.snapTerm,
+		LogRevision:      n.log.revision,
+		ElectionsStarted: n.electionsStarted,
+		ElectionElapsed:  n.electionElapsed,
+		ElectionTimeout:  n.electionTimeout,
 	}
 	if len(n.progress) > 0 {
 		s.Progress = make(map[NodeID]Progress, len(n.progress))
@@ -566,6 +575,16 @@ func (n *Node) abandonReads() {
 // SoftState is the node's volatile role, without Status's allocation. The real
 // driver checks it after every Ready.
 func (n *Node) SoftState() (Role, Term, NodeID) { return n.role, n.term, n.lead }
+
+// LogTail returns a copy of the last k entries of the log, oldest first. It is
+// what a status display shows, without the cost of copying the whole log.
+func (n *Node) LogTail(k int) []Entry {
+	ents := n.log.entries
+	if k < len(ents) {
+		ents = ents[len(ents)-k:]
+	}
+	return append([]Entry(nil), ents...)
+}
 
 // Applied is the index of the last entry the state machine has applied, as of
 // the last Advance. It is the highest index Compact will accept.

@@ -1,6 +1,7 @@
 // Package node assembles one Quorum replica from its parts: the write-ahead
 // log, the state machine, the consensus core, the driver loop, the gRPC
-// transport and the client-facing KV service, all on one gRPC listener.
+// transport, the client-facing KV service and the admin service, all on one
+// gRPC listener.
 //
 // It is what cmd/quorum-node runs, and what the in-process integration tests
 // start several of. Having one assembly for both is the point: a test that
@@ -29,6 +30,7 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/Shashankkaranamr/Quorum/internal/admin"
 	"github.com/Shashankkaranamr/Quorum/internal/config"
 	"github.com/Shashankkaranamr/Quorum/internal/kvservice"
 	"github.com/Shashankkaranamr/Quorum/internal/server"
@@ -140,7 +142,10 @@ func Start(opts Options) (*Node, error) {
 		return nil, err
 	}
 
-	trans, err := grpcx.New(opts.ID, addrs, logf)
+	trans, err := grpcx.New(opts.ID, addrs, grpcx.Options{
+		Logf:       logf,
+		MaxBackoff: time.Duration(c.Raft.TickMS*c.Raft.HeartbeatTimeoutTicks) * time.Millisecond,
+	})
 	if err != nil {
 		_ = wal.Close()
 		return nil, err
@@ -164,6 +169,12 @@ func Start(opts Options) (*Node, error) {
 	srv := grpc.NewServer()
 	trans.Register(srv)
 	kvservice.New(loop, kv, addrs, opts.RequestTimeout, opts.Hooks).Register(srv)
+	admin.New(admin.Config{
+		ID:             opts.ID,
+		Peers:          peers,
+		Tick:           time.Duration(c.Raft.TickMS) * time.Millisecond,
+		ReachableTicks: c.Raft.ElectionTimeoutMinTicks,
+	}, loop, trans).Register(srv)
 
 	n := &Node{id: opts.ID, wal: wal, loop: loop, trans: trans, srv: srv, lis: lis, serve: make(chan error, 1)}
 	go func() { n.serve <- srv.Serve(lis) }()
@@ -181,6 +192,9 @@ func (n *Node) Status() raft.Status { return n.loop.Status() }
 
 // Metrics is the node's driver counters.
 func (n *Node) Metrics() server.Metrics { return n.loop.Metrics() }
+
+// Snapshot is everything the node's loop last published.
+func (n *Node) Snapshot() server.Snapshot { return n.loop.Snapshot() }
 
 // Transport exposes fault injection on this node's links.
 func (n *Node) Transport() *grpcx.Transport { return n.trans }

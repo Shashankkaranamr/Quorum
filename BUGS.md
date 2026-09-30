@@ -54,6 +54,108 @@ Optional. Whether this was a slip or a sign the design was wrong somewhere.
 
 ---
 
+## 2026-09-30 — Restarting any node forced an election
+
+**Phase:** 6
+**Severity:** liveness / availability
+
+**Symptom observed.**
+While logging per-node metrics at the end of `TestAckedWritesSurviveLeaderKill`,
+the restarted node had started 6 elections in the few seconds it had been back.
+A probe then restarted one follower of a healthy three-node cluster. In both
+runs the term went from 10 to 12 and the leader was re-elected. Nothing was
+wrong with the leader; the restart alone cost the cluster an election.
+
+**Root cause.**
+A restarted follower that hears nothing from the leader for an election
+timeout (200–400 ms in the test config) campaigns, and its higher term deposes
+the leader. The leader was sending heartbeats every 60 ms. They did not arrive,
+because two reconnect backoffs, stacked, were longer than the election
+timeout:
+
+- `grpcx`'s own peer goroutine, which waited up to 500 ms between reconnect
+  attempts;
+- gRPC's `ClientConn` underneath it. Once its server has gone away, it redials
+  on its own schedule, **starting at 1 s** and growing towards two minutes.
+  While it waits, every stream attempt fails at once.
+
+The first fix capped only the first of these, at one heartbeat interval. The
+regression test still failed three runs out of three. The gRPC default was the
+larger delay, and it was out of sight: nothing in this code sets it.
+
+**Fix.**
+Both are capped at one heartbeat interval: `grpcx.Options.MaxBackoff`, which
+the node sets from its config, and `grpc.WithConnectParams` on every peer
+connection (`internal/transport/grpcx/grpcx.go`). Config validation keeps the
+election timeout at least three heartbeats, so a restarted node now hears the
+leader well inside it.
+
+**Regression test.**
+`TestRestartedFollowerDoesNotDisrupt` restarts a follower three times and
+requires the same leader in the same term afterwards. Before any fix: failed 3
+of 3 runs (`term 9 -> 11`, and `deposed leader 1`). With only the transport's
+own cap: still failed 3 of 3. With both caps: passed 3 of 3, nine restarts with
+no election.
+
+**What it says about the design.**
+Safety was never at risk. An election is always safe, which is why nothing in
+phases 2–5 noticed: every test passed through the extra elections. It took a
+counter, `elections_started`, and someone reading it. The design does name
+pre-vote as the protocol-level defence against a returning node disrupting the
+cluster (§9, deferred). The actual trigger here was simpler: a library default
+two orders of magnitude slower than the protocol it was carrying.
+
+---
+
+## 2026-09-30 — The tick-lag metric could not see a stalled loop
+
+**Phase:** 6
+**Severity:** observability, and a slow clock under load
+
+**Symptom observed.**
+The same metrics log reported `worst tick lag 0 ticks` on every node of a
+cluster under constant write load, across thousands of fsyncs. A metric whose
+job is to show the loop falling behind reported that it never had.
+`TestTickLagSeesASlowDisk` puts a real loop on storage whose every fsync takes
+five ticks. It reported lag 0, and only 16 ticks processed in 0.75 s, when
+about 150 were due.
+
+**Root cause.**
+The loop counted one logical tick per `time.Ticker` event. A `Ticker` does not
+queue: when its receiver is busy, it holds at most one pending tick and drops
+the rest. So however long an fsync blocked the loop, one tick was waiting
+afterwards, never more, and the lag the driver computes (ticks waiting minus
+one) was structurally zero. There was a second consequence: logical time,
+which drives election and heartbeat timers, silently ran slow whenever the
+loop was busy. That is the opposite of what DESIGN.md §1 describes, a slow
+fsync delaying ticks, measurably.
+
+The simulator had it right. It counts ticks per step and makes a slow sync
+cost ticks explicitly, which is why `TestTickLagIsMeasured` passed from phase 2
+on. The real loop simply did not share that path.
+
+**Fix.**
+The ticker now only wakes the loop. The number of ticks is computed from the
+wall clock, as ticks due since the last one, and each is delivered to the
+driver (`internal/server/loop.go`). Time spent frozen is deliberately not
+replayed; that behaviour is unchanged.
+
+**Regression test.**
+`TestTickLagSeesASlowDisk`. Against the pre-fix loop: `worst tick lag 0 ticks,
+16 ticks processed`, failed; this was run and observed. After the fix it
+reports lag of 4–9 ticks and 60 ticks processed in 0.3 s, which is correct.
+`TestTickLagIsZeroOnAFastDisk` is its other half: on fast storage the lag must
+stay at most 1, so the metric cannot pass by always reporting lag.
+
+**What it says about the design.**
+This is the measurement DESIGN.md §1 promised for the one hazard the
+architecture admits: one goroutine owns ticks and fsyncs, so a slow disk
+delays elections. It existed from phase 2, and in the real loop it could never
+have fired. It is the same lesson as the negative-control entries, applied to
+a metric: a number nobody has seen move is not evidence that nothing happened.
+
+---
+
 ## 2026-09-30 — The transport read its fault state outside its lock
 
 **Phase:** 5
@@ -471,7 +573,12 @@ found" stays visible.*
   real three-process cluster. The project's first production lock **did** have
   a bug: a data race in the transport's fault-injection state (2026-09-30,
   above). It was a race, not a stall, and it was not in the consensus code.
-  Phase 6 is where tick lag is measured under a deliberately slow disk.
+  *Phase 6:* the measurement itself turned out to be blind in the real loop
+  (2026-09-30, above). Now that it works, `TestTickLagSeesASlowDisk` shows the
+  predicted symptom on demand: a five-tick fsync produces four or more ticks of
+  lag. What has still not been observed is a stall from anything short of an
+  injected slow disk. Phase 6 did find two election-related defects, both above:
+  restarts forcing elections, and a slow clock under load. Neither was a lock.
 
 - **A write-ahead log recovery bug during phase 3.** None found. The decoder
   was fuzzed for 2.2 million executions, a real WAL was recovered after
@@ -484,6 +591,14 @@ found" stays visible.*
   recovery did turn out to have one defect, but an operational one, not a
   correctness one. It leaked a file handle when it refused to start
   (2026-09-30, above). It never recovered a wrong state.
+
+- **A linearizability or durability violation under real-process chaos in
+  phase 6.** None. Twelve seeds of `TestChaosSeeded`, about 93,000 operations
+  under kills, isolations, one-way cuts, freezes and leader isolations, were
+  all linearizable. Every acknowledged write survived leader kills and a
+  rolling restart. Under `make race` the node processes themselves run with
+  the race detector, and none reported a race. The bugs this phase found were
+  in availability and observability, not safety.
 
 - **A snapshot or compaction bug in the consensus code during phase 4.** None
   found. With compaction every 15 entries and snapshots sent in 16-byte chunks,

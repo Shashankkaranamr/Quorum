@@ -231,6 +231,16 @@ Things that will waste a cycle if you do not know them:
   or set `WALOptions.SnapDir`.
 - **`make proto-check` diffs against the git index**, so it fails on freshly
   regenerated `gen/` until that is staged. Stage `gen/` and re-run it.
+- **`make.ps1` throws on a failing target**, so a `| Select-String` after it
+  never runs. To see why `make race` failed, run the same `go test` from Bash
+  with the 64-bit gcc on PATH, or redirect the output to a file.
+- **`test/integration` runs real processes and takes minutes**, twice in
+  `make ci` (plain and under `-race`). `go test -short ./...` skips it.
+  `QUORUM_CHAOS_SEED=n` replays one chaos seed.
+- **Real-time tests must wait for a leader, not sample one.** Leadership is in
+  flux for a moment after any fault, and status calls time out on a loaded
+  machine. Use the harnesses' `leader()`, which waits, rather than a
+  momentary lookup.
 - **`buf lint` exceptions are documented in `buf.yaml`.** They are naming
   conventions only; do not add more without writing down why.
 - **`data/` is gitignored runtime state** (WAL segments, snapshots). Never

@@ -43,15 +43,15 @@ type command struct {
 var commands = []command{
 	{"plan", "[-config F]", "show what `up` would start: ports, data dirs, quorum", 0},
 	{"version", "", "print version and exit", 0},
-	{"up", "[-config F]", "start every node in the config as a separate process", 6},
-	{"down", "", "stop every node started by `up`", 6},
-	{"status", "", "show each node's role, term, commit index and applied index", 6},
-	{"kill", "<id>", "SIGKILL/TerminateProcess a node, with no graceful shutdown", 6},
-	{"start", "<id>", "restart a killed node against its existing data directory", 6},
-	{"freeze", "<id>", "park a node's event loop: alive, reachable, doing nothing", 6},
-	{"thaw", "<id>", "resume a frozen node", 6},
-	{"partition", "<ids> | <ids>", "cut the links between two groups of nodes", 6},
-	{"heal", "", "remove every injected partition", 6},
+	{"up", "[-config F] [-bin B]", "start every node in the config as a separate process", 0},
+	{"down", "[-config F]", "kill every running node (there is no graceful stop on Windows)", 0},
+	{"status", "[-config F]", "show each node's process, role, term, commit and applied index", 0},
+	{"kill", "[-config F] <id>", "SIGKILL/TerminateProcess a node, with no graceful shutdown", 0},
+	{"start", "[-config F] [-bin B] <id>", "restart a killed node against its existing data directory", 0},
+	{"freeze", "[-config F] [-for D] <id>", "park a node's event loop: alive, reachable, doing nothing", 0},
+	{"thaw", "[-config F] <id>", "resume a frozen node", 0},
+	{"partition", "[-config F] [-oneway] <ids> '|' <ids>", "cut the links between two groups (-oneway: first cannot reach second)", 0},
+	{"heal", "[-config F]", "remove every injected partition", 0},
 	{"put", "[-config F] <key> <value>", "write through the leader", 0},
 	{"get", "[-config F] <key>", "linearizable read via ReadIndex", 0},
 }
@@ -104,6 +104,8 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return plan(args[1:], stdout, stderr)
 	case "put", "get":
 		return kv(cmd.name, args[1:], stdout, stderr)
+	case "up", "down", "status", "kill", "start", "freeze", "thaw", "partition", "heal":
+		return operate(cmd.name, args[1:], stdout, stderr)
 	default:
 		return errNotYet{cmd}
 	}
@@ -135,7 +137,7 @@ func usage(w io.Writer) {
 		}
 	}
 	_ = tw.Flush()
-	fmt.Fprintf(w, "\nThis is phase 5 of 8. PLAN.md defines what each phase delivers.\n")
+	fmt.Fprintf(w, "\nThis is phase 6 of 8. PLAN.md defines what each phase delivers.\n")
 }
 
 // errNotFound is get's answer for a key that does not exist. It exits non-zero
@@ -235,8 +237,7 @@ func plan(args []string, stdout, stderr io.Writer) error {
 		c.Raft.HeartbeatTimeoutTicks*c.Raft.TickMS,
 		c.Raft.TickMS)
 	fmt.Fprintf(stdout, "\n%s\n", strings.TrimSpace(`
-this prints the plan but does not start anything; start each node with the
-command shown, or wait for "quorumctl up" (phase 6).
+this prints the plan but does not start anything; "quorumctl up" does.
 `))
 	return nil
 }

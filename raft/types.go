@@ -389,6 +389,11 @@ type Status struct {
 	// change without copying the log.
 	LogRevision uint64
 
+	// ElectionsStarted counts the elections this node has started, over its
+	// lifetime in this process. A number far above the number of injected
+	// faults means the cluster is churning through elections.
+	ElectionsStarted uint64
+
 	// ElectionElapsed and ElectionTimeout are exposed so a test can assert
 	// that the timer is reset only on the two events Raft permits, rather
 	// than inferring it from behaviour.
@@ -418,4 +423,9 @@ type Progress struct {
 	// during this leadership. It makes "the follower caught up by snapshot"
 	// something a test can observe rather than infer.
 	SnapshotsSent uint64
+
+	// TicksSinceContact is how many ticks have passed since the leader last
+	// heard any response from this follower. It is observation only: the
+	// core makes no decision on it (there is no CheckQuorum; DESIGN.md §10).
+	TicksSinceContact int
 }

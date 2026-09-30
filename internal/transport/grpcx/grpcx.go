@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
@@ -27,9 +29,26 @@ const (
 	inboundCap  = 4096
 	outboundCap = 1024
 
-	minBackoff = 20 * time.Millisecond
-	maxBackoff = 500 * time.Millisecond
+	minBackoff = 10 * time.Millisecond
+
+	// DefaultMaxBackoff caps the reconnect delay when Options leaves it zero.
+	DefaultMaxBackoff = 100 * time.Millisecond
 )
+
+// Options configure a Transport.
+type Options struct {
+	// Logf receives operational messages. Nil discards them.
+	Logf func(string, ...any)
+
+	// MaxBackoff caps how long a peer's goroutine waits between reconnect
+	// attempts. It must stay well under the election timeout: a node that
+	// restarts and hears nothing from the leader for a full election timeout
+	// campaigns and deposes it. The node sets it to one heartbeat interval,
+	// which config validation keeps below a third of the election timeout.
+	// The first version used a fixed 500ms, and every restart forced an
+	// election (BUGS.md, 2026-09-30).
+	MaxBackoff time.Duration
+}
 
 // Transport is the real Raft transport: one long-lived client stream per
 // directed link, and the RaftTransport service for the streams peers open to
@@ -53,6 +72,7 @@ type Transport struct {
 	inbound chan raft.Message
 	peers   map[raft.NodeID]*peer
 	logf    func(string, ...any)
+	maxWait time.Duration
 	closed  chan struct{}
 
 	// mu guards the injected faults. It is the one lock in the transport,
@@ -68,15 +88,20 @@ var _ transport.Transport = (*Transport)(nil)
 
 // New creates a transport for self. addrs maps every OTHER node to its gRPC
 // address. Outbound connections are made lazily, by each peer's goroutine.
-func New(self raft.NodeID, addrs map[raft.NodeID]string, logf func(string, ...any)) (*Transport, error) {
+func New(self raft.NodeID, addrs map[raft.NodeID]string, opts Options) (*Transport, error) {
+	logf := opts.Logf
 	if logf == nil {
 		logf = func(string, ...any) {}
+	}
+	if opts.MaxBackoff <= 0 {
+		opts.MaxBackoff = DefaultMaxBackoff
 	}
 	t := &Transport{
 		self:       self,
 		inbound:    make(chan raft.Message, inboundCap),
 		peers:      make(map[raft.NodeID]*peer, len(addrs)),
 		logf:       logf,
+		maxWait:    max(opts.MaxBackoff, minBackoff),
 		closed:     make(chan struct{}),
 		blockedOut: map[raft.NodeID]bool{},
 		blockedIn:  map[raft.NodeID]bool{},
@@ -85,7 +110,21 @@ func New(self raft.NodeID, addrs map[raft.NodeID]string, logf func(string, ...an
 		if id == self {
 			continue
 		}
-		conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+		conn, err := grpc.NewClient(addr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			// gRPC redials a lost server on its own schedule, starting at 1s
+			// and growing to two minutes by default. Left alone, that alone
+			// outlasts any election timeout, whatever this transport's own
+			// backoff says. Both are capped at the same bound.
+			grpc.WithConnectParams(grpc.ConnectParams{
+				Backoff: backoff.Config{
+					BaseDelay:  minBackoff,
+					Multiplier: 1.6,
+					Jitter:     0.2,
+					MaxDelay:   t.maxWait,
+				},
+				MinConnectTimeout: time.Second,
+			}))
 		if err != nil {
 			_ = t.closePeers()
 			return nil, fmt.Errorf("grpcx: client for node %d at %s: %w", id, addr, err)
@@ -185,6 +224,21 @@ func (t *Transport) BlockInbound(peers ...raft.NodeID) {
 	}
 }
 
+// Blocked reports the peers whose links are cut, outbound and inbound, sorted.
+func (t *Transport) Blocked() (out, in []raft.NodeID) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id := range t.blockedOut {
+		out = append(out, id)
+	}
+	for id := range t.blockedIn {
+		in = append(in, id)
+	}
+	slices.Sort(out)
+	slices.Sort(in)
+	return out, in
+}
+
 // Heal removes every injected fault.
 func (t *Transport) Heal() {
 	t.mu.Lock()
@@ -272,7 +326,7 @@ func (p *peer) run() {
 		if !p.discardFor(backoff) {
 			return
 		}
-		backoff = min(2*backoff, maxBackoff)
+		backoff = min(2*backoff, p.t.maxWait)
 	}
 }
 

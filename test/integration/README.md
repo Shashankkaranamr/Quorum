@@ -1,10 +1,14 @@
 # Integration tests
 
-Tests that start real `quorum-node` processes over real localhost gRPC.
-Phase 5 added the first, `TestProcessesServeReadsAndWrites`: it builds the
-binaries, runs a three-process cluster, drives it with the real `quorumctl`,
-and kills every process outright. Phase 6 adds the fault-injection suite that
-kills, partitions, freezes and restarts them.
+Tests that start real `quorum-node` processes over real localhost gRPC, kill
+them with the supervisor, and break them through the admin API -- the same
+paths `quorumctl` uses. The binaries are built once per run, in `TestMain`;
+under `-race` the nodes are built with the race detector too, and a race
+report in any node's log fails the test.
+
+`TestChaosSeeded` runs 3 seeds by default. `QUORUM_CHAOS_SEED=n` replays one
+seed's fault schedule; `QUORUM_CHAOS_ITERATIONS=n` runs seeds 1..n as a soak.
+`go test -short` skips everything here.
 
 It is deliberately separate from the fast deterministic suite under
 `internal/testutil/`. That one runs the consensus core in a single-threaded

@@ -164,6 +164,9 @@ func (n *Node) handleInstallSnapshotResponse(m Message) {
 		return
 	}
 	pr := n.progress[m.From]
+	if pr != nil {
+		pr.TicksSinceContact = 0
+	}
 	if pr == nil || pr.PendingSnapshot == 0 || m.SnapshotMeta.Index != pr.PendingSnapshot {
 		// An acknowledgement for a transfer no longer running.
 		return
@@ -290,6 +293,8 @@ func (n *Node) handleAppendEntriesResponse(m Message) {
 	if pr == nil {
 		return
 	}
+
+	pr.TicksSinceContact = 0
 
 	// Any response in our term, success or not, is this peer acknowledging us
 	// as leader. Step has already discarded responses from older terms.

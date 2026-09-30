@@ -16,7 +16,7 @@ a later phase is started before that.
 > we actually are** — what is built, what is verified, and what the next concrete
 > steps are. Check it before starting work.
 
-**Current status: phase 5 complete.**
+**Current status: phase 6 complete.**
 
 | Phase | Title | Status |
 |---|---|---|
@@ -25,7 +25,7 @@ a later phase is started before that.
 | 3 | Crash-safe persistence | ✅ complete |
 | 4 | Snapshotting and log compaction | ✅ complete |
 | 5 | gRPC KV service, linearizable reads, deduplication | ✅ complete |
-| 6 | Fault-injection suite and bug log | not started |
+| 6 | Fault-injection suite and bug log | ✅ complete |
 | 7 | Live cluster visualizer | not started |
 | 8 | Integration, documentation and demo | not started |
 
@@ -419,7 +419,7 @@ revised synchronization list, are in DESIGN.md §10.
 
 ---
 
-## Phase 6 — Fault-injection suite and bug log
+## Phase 6 — Fault-injection suite and bug log ✅
 
 **Goal.** Every claim about behaviour under failure is backed by a test that
 would fail if the claim were false.
@@ -428,31 +428,95 @@ would fail if the claim were false.
 `test/integration/`, the fault-injection subcommands of `quorumctl`, and real
 entries in `BUGS.md`.
 
+**Delivered.**
+- `internal/supervisor`: spawns real `quorum-node` processes, records their
+  PIDs, kills with TerminateProcess/SIGKILL, and confirms the PID is gone
+  before reporting success. It refuses to act on a recorded PID that now
+  belongs to another program.
+- `internal/admin`: the Admin API from phase 1's proto. Status comes from the
+  loop's published snapshot, so a frozen node still answers. Directed
+  `BlockLinks`, `Heal`, `Freeze` with optional auto-thaw, and `Thaw`
+  reporting ticks missed.
+- `server.Loop` freeze and thaw, which are cooperative, not SIGSTOP.
+- A real fsync p99.
+- Every `quorumctl` subcommand: `up`, `down`, `status`, `kill`, `start`,
+  `freeze`, `thaw`, `partition` (both ways, or `-oneway`) and `heal`.
+- `test/integration`: a real-process harness and the suite below.
+- `internal/testutil/lincheck`: the shared Porcupine model and workload.
+
 **Acceptance criteria**
 
-1. **The harness can inflict real faults on real processes.** Kill
-   (`TerminateProcess`/`SIGKILL`), restart against the same data directory,
-   partition an arbitrary subset **bidirectionally and one-way**, heal, freeze
-   and thaw. Each verified directly — a kill asserts the PID is gone.
-2. **Killing the leader mid-write loses nothing.**
-   `TestAckedWritesSurviveLeaderKill`: write continuously, kill the leader
-   mid-flight, and require that **every write that received a success response**
-   is still readable afterwards, and that a new leader is elected within a
-   bounded time.
-3. **A minority refuses writes; a majority continues; healing reconciles.**
-   `TestMinorityPartitionRefusesWrites`: the minority side returns errors rather
-   than false successes, the majority keeps committing, and after `heal` the
-   minority's log matches the majority's exactly.
-4. **Rolling restart stays available.** `TestRollingRestart`: restart every node
-   one at a time; no committed data is lost and the cluster serves throughout.
-5. **Seeded chaos stays linearizable.** `TestChaosSeeded`: N iterations of a
-   randomized fault schedule, each reproducible from its seed, with a Porcupine
-   check over the recorded history.
-6. **The traceability table is complete.** Every guarantee in DESIGN.md §6 names
-   a test that exists and passes. A claim with no test is a defect in this phase.
-7. **`BUGS.md` has real entries**, each naming the regression test that now
-   guards it. Entries record what testing actually found; nothing is invented to
-   match a prediction.
+1. ✅ **The harness can inflict real faults on real processes.**
+   `TestHarnessInflictsRealFaults`, on three real processes, checks each fault
+   directly:
+   - Kill: the PID is asserted alive before and gone after, and the admin API
+     stops answering.
+   - Restart: the node comes back with at least the log it had on disk.
+   - Bidirectional partition: blocked peers show in status, and the
+     partitioned node's commit index stands still while the others commit.
+   - One-way partition: the leader can hear but not be heard. The followers
+     elect a new leader, and the old one steps down because it **hears** the
+     new term, which proves the other direction still works.
+   - Freeze: status still answers and says frozen; the process is alive; the
+     commit index stands still. Thaw reports the time frozen and ticks missed,
+     and a bounded freeze thaws itself.
+
+   `TestQuorumctlDrivesTheCluster` runs the same operations through the real
+   `quorumctl` binary.
+2. ✅ **Killing the leader mid-write loses nothing.**
+   `TestAckedWritesSurviveLeaderKill`. Four writers run continuously and the
+   leader process is killed. A new leader appears within the bound (about
+   200 ms observed, against a 5 s bound). All of the roughly 2,000
+   acknowledged writes are read back with their values. Negative control:
+   `TestAckedCheckCatchesLostData` wipes every data directory, and the check
+   reports 20 of 20 writes lost.
+3. ✅ **A minority refuses writes; a majority continues; healing reconciles.**
+   `TestMinorityPartitionRefusesWrites`, on five processes. The minority,
+   holding the old leader, answers a write with an error, never a success. The
+   majority commits ten writes. After healing, all five logs have the same last
+   index and term, fully committed, with identical tails, and the refused
+   write is nowhere. Negative control for the log comparison:
+   `TestLogMatchCheckCatchesDivergence`.
+4. ✅ **Rolling restart stays available.** `TestRollingRestart`. Each node is
+   killed and restarted in turn while three clients write and read. Zero
+   operations failed; the slowest put-and-get took about 700 ms. Every one of
+   the roughly 2,300 acknowledged writes survived, checked with the same
+   verifier as criterion 2.
+5. ✅ **Seeded chaos stays linearizable.** `TestChaosSeeded`. Each seed runs
+   8 s of randomized faults against a real cluster, with five clients, one of
+   them read-only: kill and restart, isolation, one-way cuts, freezes, and
+   leader isolation. The history is checked with the Porcupine model and
+   workload whose negative controls run in `internal/node`. There are 3 seeds
+   by default; a 12-seed soak recorded about 93,000 operations, all
+   linearizable. Replay a seed with `QUORUM_CHAOS_SEED=n`; the seed fixes the
+   schedule, not the scheduler (DESIGN.md §10).
+6. ✅ **The traceability table is complete.** DESIGN.md §7 opens with a table
+   mapping each §6 guarantee to its tests. `TestEveryGuaranteeNamesExistingTests`
+   fails if a guarantee has no row or a named test does not exist, and
+   `TestTraceabilityCheckCatchesGaps` is its negative control. The OS-crash
+   half of the durability guarantee cannot be tested here, and its row says so.
+7. ✅ **`BUGS.md` has real entries.** Ten across the project, each with a
+   regression test observed failing first. Two came from this phase:
+   - a restarted node forced an election, because two reconnect backoffs
+     outlasted the election timeout;
+   - the tick-lag metric could not see a stalled loop, and logical time ran
+     slow under load.
+
+**Also delivered beyond the original criteria**
+
+- Under `make race`, the node processes are built with the race detector too,
+  and a race report in any node's log fails the test.
+  `TestNodesAreRaceCheckedUnderRace` checks the build flags, so the log scan
+  cannot pass vacuously.
+- `TestRestartedFollowerDoesNotDisrupt`, `TestTickLagSeesASlowDisk` and
+  `TestTickLagIsZeroOnAFastDisk`: the regression tests for this phase's bugs.
+- `TestSupervisorIgnoresAStrangersPID`: a PID file naming a live process that
+  is not quorum-node, in this case the test itself, is ignored and not killed.
+
+**Not done, and why.** The `http_port` still serves nothing; the visualizer's
+backend is phase 7. The status stream it will read, `WatchStatus`, is built and
+tested (`TestWatchStatusStreamsLiveState`, which also checks that it keeps
+streaming while the node is frozen).
 
 ---
 

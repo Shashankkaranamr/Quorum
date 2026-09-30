@@ -28,9 +28,9 @@ func newPair(t *testing.T) pair {
 	require.NoError(t, err)
 	addrs := map[raft.NodeID]string{1: la.Addr().String(), 2: lb.Addr().String()}
 
-	a, err := New(1, addrs, nil)
+	a, err := New(1, addrs, Options{})
 	require.NoError(t, err)
-	b, err := New(2, addrs, nil)
+	b, err := New(2, addrs, Options{})
 	require.NoError(t, err)
 	sa, sb := grpc.NewServer(), grpc.NewServer()
 	a.Register(sa)

@@ -18,5 +18,6 @@
 // Node kills are not here; they belong to the supervisor, because killing a
 // process is not something the process can be asked to do to itself.
 //
-// Phase 6 and phase 7 fill this package in. It is currently a documented stub.
+// Phase 6 built it; phase 7's visualizer is the second consumer of
+// WatchStatus.
 package admin
