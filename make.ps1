@@ -37,6 +37,7 @@ $Targets = [ordered]@{
     'proto-check' = 'Fail if checked-in generated code is stale'
     'build'       = 'Build every binary into bin/'
     'test'        = 'Run the test suite'
+    'faults'      = 'Run only the real-process fault suite: kills, partitions, freezes, chaos'
     'race'        = 'Run the test suite under the race detector'
     'cover'       = 'Run tests and report coverage per package'
     'vet'         = 'Run go vet'
@@ -123,6 +124,8 @@ function Target-Build {
 }
 
 function Target-Test { Invoke-Checked { go test ./... } }
+
+function Target-Faults { Invoke-Checked { go test -count=1 -v ./test/integration/... } }
 
 # The race detector needs cgo, which needs a 64-bit C compiler.
 #
@@ -239,6 +242,7 @@ switch ($Target) {
     'proto-check' { Target-ProtoCheck }
     'build' { Target-Build }
     'test' { Target-Test }
+    'faults' { Target-Faults }
     'race' { Target-Race }
     'cover' { Target-Cover }
     'vet' { Target-Vet }

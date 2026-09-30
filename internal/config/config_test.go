@@ -16,9 +16,9 @@ import (
 // defaults.
 const minimalYAML = `
 nodes:
-  - {id: 1, host: 127.0.0.1, grpc_port: 7001, http_port: 8001}
-  - {id: 2, host: 127.0.0.1, grpc_port: 7002, http_port: 8002}
-  - {id: 3, host: 127.0.0.1, grpc_port: 7003, http_port: 8003}
+  - {id: 1, host: 127.0.0.1, grpc_port: 7001}
+  - {id: 2, host: 127.0.0.1, grpc_port: 7002}
+  - {id: 3, host: 127.0.0.1, grpc_port: 7003}
 `
 
 func writeConfig(t *testing.T, body string) string {
@@ -63,7 +63,6 @@ func TestAccessors(t *testing.T) {
 	n, ok := c.Node(2)
 	require.True(t, ok)
 	require.Equal(t, "127.0.0.1:7002", n.GRPCAddr())
-	require.Equal(t, "127.0.0.1:8002", n.HTTPAddr())
 
 	_, ok = c.Node(99)
 	require.False(t, ok, "unknown id must not resolve")
@@ -117,7 +116,7 @@ func TestLoadRejectsBadConfigs(t *testing.T) {
 	}{
 		{
 			name:    "too few nodes",
-			yaml:    "nodes:\n  - {id: 1, host: 127.0.0.1, grpc_port: 7001, http_port: 8001}\n",
+			yaml:    "nodes:\n  - {id: 1, host: 127.0.0.1, grpc_port: 7001}\n",
 			wantMsg: "between 3 and 5 nodes",
 		},
 		{

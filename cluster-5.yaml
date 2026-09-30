@@ -7,11 +7,11 @@
 cluster_id: quorum-local-5
 
 nodes:
-  - {id: 1, host: 127.0.0.1, grpc_port: 7001, http_port: 8001}
-  - {id: 2, host: 127.0.0.1, grpc_port: 7002, http_port: 8002}
-  - {id: 3, host: 127.0.0.1, grpc_port: 7003, http_port: 8003}
-  - {id: 4, host: 127.0.0.1, grpc_port: 7004, http_port: 8004}
-  - {id: 5, host: 127.0.0.1, grpc_port: 7005, http_port: 8005}
+  - {id: 1, host: 127.0.0.1, grpc_port: 7001}
+  - {id: 2, host: 127.0.0.1, grpc_port: 7002}
+  - {id: 3, host: 127.0.0.1, grpc_port: 7003}
+  - {id: 4, host: 127.0.0.1, grpc_port: 7004}
+  - {id: 5, host: 127.0.0.1, grpc_port: 7005}
 
 raft:
   tick_ms: 50

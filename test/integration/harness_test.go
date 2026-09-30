@@ -107,7 +107,7 @@ func writeConfig(t *testing.T, dir string, n int) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "cluster_id: integration\nnodes:\n")
 	for id := 1; id <= n; id++ {
-		fmt.Fprintf(&b, "  - {id: %d, host: 127.0.0.1, grpc_port: %d, http_port: %d}\n", id, freePort(t), freePort(t))
+		fmt.Fprintf(&b, "  - {id: %d, host: 127.0.0.1, grpc_port: %d}\n", id, freePort(t))
 	}
 	fmt.Fprintf(&b, "raft:\n  tick_ms: %d\n  snapshot_threshold_entries: 500\n", testTickMS)
 	fmt.Fprintf(&b, "storage:\n  data_dir: %q\n", filepath.ToSlash(filepath.Join(dir, "data")))

@@ -114,7 +114,6 @@ func describe(w io.Writer, c *config.Cluster, self config.Node, configPath strin
 	fmt.Fprintf(tw, "cluster\t%s (%s)\n", c.ClusterID, configPath)
 	fmt.Fprintf(tw, "node id\t%d\n", self.ID)
 	fmt.Fprintf(tw, "grpc\t%s\t(raft peers, kv api, admin api)\n", self.GRPCAddr())
-	fmt.Fprintf(tw, "http\t%s\t(status, metrics)\n", self.HTTPAddr())
 	fmt.Fprintf(tw, "data dir\t%s\n", c.DataDir(self.ID))
 	fmt.Fprintf(tw, "size\t%d nodes, quorum %d, tolerates %d failure(s)\n",
 		len(c.Nodes), c.Quorum(), len(c.Nodes)-c.Quorum())

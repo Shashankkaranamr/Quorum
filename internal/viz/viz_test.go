@@ -117,7 +117,7 @@ func writeConfig(t *testing.T, n int) string {
 	b.WriteString("nodes:\n")
 	for i := 1; i <= n; i++ {
 		// Ports nothing listens on: the nodes are "down".
-		fmt.Fprintf(&b, "  - {id: %d, host: 127.0.0.1, grpc_port: %d, http_port: %d}\n", i, 1+i, 100+i)
+		fmt.Fprintf(&b, "  - {id: %d, host: 127.0.0.1, grpc_port: %d}\n", i, 1+i)
 	}
 	fmt.Fprintf(&b, "storage:\n  data_dir: %q\n", filepath.ToSlash(filepath.Join(t.TempDir(), "data")))
 	p := filepath.Join(t.TempDir(), "cluster.yaml")

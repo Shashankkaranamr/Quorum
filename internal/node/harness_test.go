@@ -68,13 +68,7 @@ func newCluster(t *testing.T, n int, tweak func(*node.Options)) *cluster {
 		id := raft.NodeID(i)
 		listeners[id] = lis
 		port := lis.Addr().(*net.TCPAddr).Port
-		// Nothing serves HTTP yet (phase 7), but the config requires a
-		// distinct port, so reserve a real one.
-		httpLis, err := net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		httpPort := httpLis.Addr().(*net.TCPAddr).Port
-		require.NoError(t, httpLis.Close())
-		c.cfg.Nodes = append(c.cfg.Nodes, config.Node{ID: config.NodeID(i), Host: "127.0.0.1", GRPCPort: port, HTTPPort: httpPort})
+		c.cfg.Nodes = append(c.cfg.Nodes, config.Node{ID: config.NodeID(i), Host: "127.0.0.1", GRPCPort: port})
 		c.addrs[id] = net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	}
 	require.NoError(t, c.cfg.Validate())
@@ -168,6 +162,16 @@ func (c *cluster) isolate(id raft.NodeID) {
 		} else {
 			nd.Transport().Partition(id)
 		}
+	}
+}
+
+// split cuts every link between groups a and b, both ways, on both ends.
+func (c *cluster) split(a, b []raft.NodeID) {
+	for _, x := range a {
+		c.nodes[x].Transport().Partition(b...)
+	}
+	for _, y := range b {
+		c.nodes[y].Transport().Partition(a...)
 	}
 }
 

@@ -45,8 +45,11 @@
     <form id="putform" class="row">
       <input id="key" placeholder="key" value="greeting" aria-label="key">
       <input id="value" placeholder="value" value="hello" aria-label="value">
+      <select id="via" aria-label="send the write through"><option value="0">via leader</option></select>
       <button type="submit">Put</button>
     </form>
+    <p class="note">"via node N" sends the write to that node only, with no redirect: what a client stuck on one
+      side of a partition sees. A node in a minority can never acknowledge it.</p>
     <label class="check"><input type="checkbox" id="load"> background writes (to watch entries replicate)</label>
     <p id="toast" class="toast" role="status"></p>
   </section>

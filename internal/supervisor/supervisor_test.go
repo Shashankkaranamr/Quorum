@@ -17,9 +17,9 @@ func newTestSupervisor(t *testing.T) *Supervisor {
 	dir := t.TempDir()
 	cfg := filepath.Join(dir, "cluster.yaml")
 	yaml := fmt.Sprintf("nodes:\n"+
-		"  - {id: 1, host: 127.0.0.1, grpc_port: 17001, http_port: 18001}\n"+
-		"  - {id: 2, host: 127.0.0.1, grpc_port: 17002, http_port: 18002}\n"+
-		"  - {id: 3, host: 127.0.0.1, grpc_port: 17003, http_port: 18003}\n"+
+		"  - {id: 1, host: 127.0.0.1, grpc_port: 17001}\n"+
+		"  - {id: 2, host: 127.0.0.1, grpc_port: 17002}\n"+
+		"  - {id: 3, host: 127.0.0.1, grpc_port: 17003}\n"+
 		"storage:\n  data_dir: %q\n", filepath.ToSlash(filepath.Join(dir, "data")))
 	require.NoError(t, os.WriteFile(cfg, []byte(yaml), 0o644))
 	s, err := New(filepath.Join(dir, "quorum-node"), cfg)

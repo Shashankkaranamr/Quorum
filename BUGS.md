@@ -20,6 +20,29 @@ tests were not trying hard enough.
 
 Entries are newest first.
 
+## Index
+
+Eleven entries, each guarded by a regression test observed failing before its
+fix. Five were in production code -- the client, the transport (twice), the
+driver loop and recovery's error path -- and six were tests that were wrong or
+could not fail, which are worth exactly as much to catch.
+None was a violation of a Raft safety property; the notes at the end say what
+that does and does not mean.
+
+| Date | Bug | Severity | Regression test |
+|---|---|---|---|
+| 2026-09-30 | A client could be trapped in a stale minority by honest redirects | liveness | `TestClientEscapesAStaleMinority` |
+| 2026-09-30 | Restarting any node forced an election | liveness | `TestRestartedFollowerDoesNotDisrupt` |
+| 2026-09-30 | The tick-lag metric could not see a stalled loop | observability | `TestTickLagSeesASlowDisk` |
+| 2026-09-30 | The transport read its fault state outside its lock | data race | `TestFaultStateIsSafeToChangeUnderTraffic` |
+| 2026-09-30 | The linearizability workload could not produce a stale read | tests | `TestLinearizabilityCatchesQuorumlessReads` |
+| 2026-09-30 | A refused recovery kept the log's tail segment open | operational | `TestRefusedRecoveryReleasesTheLog` |
+| 2026-09-30 | The snapshot-restore check could not detect lost data | tests | `TestRestoreCheckCatchesALossyRestore` |
+| 2026-09-30 | Snapshot sending treated "entry missing" as "entry compacted" | tests | `TestMutatedRaftTripsInvariant` |
+| 2026-09-27 | The durability audit flagged a correct Ready spanning two terms | tests | `TestDurabilityAuditCatchesMisorderedDrivers` |
+| 2026-09-23 | Failure-message arguments evaluated on every passing assertion | tests | `TestFailureMessagesAreLazy` |
+| 2026-09-23 | A reconvergence assertion that could pass without reconverging | tests | `TestMinorityPartitionCannotCommit` |
+
 ---
 
 ## Entry format
@@ -51,6 +74,60 @@ pre-fix code. A test that passes both before and after is not a regression test.
 **What it says about the design.**
 Optional. Whether this was a slip or a sign the design was wrong somewhere.
 ````
+
+---
+
+## 2026-09-30 — A client could be trapped in a stale minority by honest redirects
+
+**Phase:** 8
+**Severity:** liveness / availability
+
+**Symptom observed.**
+While recording the visualizer walkthrough on a five-node cluster, the leader
+and one follower were cut off from the other three with background writes
+running. The majority elected a new leader -- and its commit index then sat
+still for twenty seconds. The minority's logs, meanwhile, kept growing with
+entries that could never commit. The writes were going to the wrong side and
+never finding the right one.
+
+**Root cause.**
+The client library's retry loop, on each failure, either followed the
+server's leader hint or moved on to the next node. With the old leader and a
+follower on the minority side, it cycled forever between them: the old leader
+accepted the write and timed out (it cannot commit), the client moved on to
+the follower, and the follower -- honestly, it still believed it -- answered
+`NOT_LEADER` with a hint naming the old leader. The client followed the hint
+straight back. Nodes 3, 4 and 5 were never tried. The failing call made 31
+attempts in 5 seconds without leaving the minority.
+
+Every linearizability test in phases 5 and 6 cut off a single node, so there
+was never a follower on the stale side to point clients back. It takes a
+minority of at least two, which a five-node cluster allows and a three-node
+one does not.
+
+**Fix.**
+Within one call, a node that failed to answer definitively is remembered: a
+hint pointing at it is not followed, and rotation tries the nodes not yet
+tried first, starting over only once all have failed
+(`internal/client/client.go`).
+
+**Regression test.**
+`TestClientEscapesAStaleMinority` splits a five-node cluster {leader, one
+follower} against three, with the client's last-known leader on the minority
+side, and requires three writes to commit through the majority. Against the
+pre-fix client it failed 2 of 3 runs (`write 0 never escaped the minority (31
+attempts)`; the passing run rotated onto the majority by luck). After the fix
+it passed 5 of 5, each escaping in about 0.6 s. The walkthrough was then
+re-recorded, and the majority's commit index climbs through the partition
+(docs/walkthrough, frame 3).
+
+**What it says about the design.**
+Every server told the truth as it knew it; the bug was in trusting a hint more
+than the evidence of the last few seconds. The broader lesson is about test
+shape again: the fault suite's partitions were all "one node against the
+rest", and a whole class of behaviour needs two nodes on the losing side. So
+`TestChaosSeeded` now also runs a five-node seed whose isolations cut off a
+random pair of nodes.
 
 ---
 

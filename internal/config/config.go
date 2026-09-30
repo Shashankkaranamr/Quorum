@@ -31,10 +31,11 @@ type Node struct {
 	ID   NodeID `yaml:"id"`
 	Host string `yaml:"host"`
 	// GRPCPort serves three services on one listener: the Raft peer transport,
-	// the client-facing KV API, and the admin/fault-injection API.
+	// the client-facing KV API, and the admin/fault-injection API. It is the
+	// node's only port: the visualizer reads status from the admin API's
+	// stream rather than scraping HTTP. An http_port was planned in phase 1
+	// and removed in phase 8 once nothing needed it (DESIGN.md §10).
 	GRPCPort int `yaml:"grpc_port"`
-	// HTTPPort serves status and metrics, and is what the visualizer scrapes.
-	HTTPPort int `yaml:"http_port"`
 }
 
 // GRPCAddr is the dial target for this node's gRPC listener.
@@ -42,10 +43,6 @@ func (n Node) GRPCAddr() string {
 	return net.JoinHostPort(n.Host, strconv.Itoa(n.GRPCPort))
 }
 
-// HTTPAddr is the dial target for this node's status/metrics listener.
-func (n Node) HTTPAddr() string {
-	return net.JoinHostPort(n.Host, strconv.Itoa(n.HTTPPort))
-}
 
 // RaftParams are the consensus timing and sizing knobs.
 //
@@ -198,23 +195,14 @@ func (c *Cluster) Validate() error {
 		if n.Host == "" {
 			return fmt.Errorf("nodes[%d] (id %d): host must not be empty", i, n.ID)
 		}
-		// Iterated as a slice rather than a map so the error reported for a
-		// node with two bad ports is deterministic.
-		for _, p := range []struct {
-			label string
-			port  int
-		}{{"grpc_port", n.GRPCPort}, {"http_port", n.HTTPPort}} {
-			if p.port < 1 || p.port > 65535 {
-				return fmt.Errorf("nodes[%d] (id %d): %s %d out of range 1-65535",
-					i, n.ID, p.label, p.port)
-			}
-			key := net.JoinHostPort(n.Host, strconv.Itoa(p.port))
-			if owner, dup := seenPort[key]; dup {
-				return fmt.Errorf("nodes[%d] (id %d): %s %s already used by node %d",
-					i, n.ID, p.label, key, owner)
-			}
-			seenPort[key] = n.ID
+		if n.GRPCPort < 1 || n.GRPCPort > 65535 {
+			return fmt.Errorf("nodes[%d] (id %d): grpc_port %d out of range 1-65535", i, n.ID, n.GRPCPort)
 		}
+		key := net.JoinHostPort(n.Host, strconv.Itoa(n.GRPCPort))
+		if owner, dup := seenPort[key]; dup {
+			return fmt.Errorf("nodes[%d] (id %d): grpc_port %s already used by node %d", i, n.ID, key, owner)
+		}
+		seenPort[key] = n.ID
 	}
 
 	return c.Raft.validate()

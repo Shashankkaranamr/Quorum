@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -64,12 +65,19 @@ func chaosSeeds(t *testing.T) []uint64 {
 func TestChaosSeeded(t *testing.T) {
 	skipShort(t)
 	for _, seed := range chaosSeeds(t) {
-		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) { chaos(t, seed) })
+		t.Run(fmt.Sprintf("seed=%d", seed), func(t *testing.T) { chaos(t, seed, 3) })
+	}
+	// One five-node run, whose isolations cut off a pair of nodes: a
+	// minority of two, with a follower on the stale side to point clients
+	// back at the stale leader. Every three-node schedule misses that shape,
+	// and a real client bug lived in it (BUGS.md, 2026-09-30).
+	if os.Getenv("QUORUM_CHAOS_SEED") == "" {
+		t.Run("n=5/seed=1", func(t *testing.T) { chaos(t, 1, 5) })
 	}
 }
 
-func chaos(t *testing.T, seed uint64) {
-	c := startCluster(t, 3)
+func chaos(t *testing.T, seed uint64, n int) {
+	c := startCluster(t, n)
 	c.waitLeader(electionBound)
 	ids := c.sup.IDs()
 
@@ -111,9 +119,22 @@ func chaos(t *testing.T, seed uint64) {
 			time.Sleep(d)
 			c.start(id)
 		case 1:
-			id, d := pick(), hold(300, 1500)
-			note("isolate", fmt.Sprintf("isolate %d for %s", id, d))
-			c.partition([]raft.NodeID{id}, c.others(id))
+			// A minority: one node of three, or two of five.
+			minority := []raft.NodeID{pick()}
+			for len(minority) < (n-1)/2 {
+				if id := pick(); !slices.Contains(minority, id) {
+					minority = append(minority, id)
+				}
+			}
+			var rest []raft.NodeID
+			for _, id := range ids {
+				if !slices.Contains(minority, id) {
+					rest = append(rest, id)
+				}
+			}
+			d := hold(300, 1500)
+			note("isolate", fmt.Sprintf("isolate %v for %s", minority, d))
+			c.partition(minority, rest)
 			time.Sleep(d)
 			c.heal()
 		case 2:

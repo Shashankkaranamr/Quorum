@@ -1,6 +1,7 @@
 package node_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -163,4 +164,65 @@ func TestNotLeaderRedirect(t *testing.T) {
 
 	fresh, _ := freshWrites(c.results(lead), cl.ID())
 	require.Equal(t, 20, fresh)
+}
+
+// TestPinnedClientSeesTheMinorityRefuse: a client pinned to a leader that has
+// been cut off from the majority must never be told its write succeeded -- it
+// cannot commit there -- and a client pinned to a follower is told, definitely,
+// that its write did not happen rather than being redirected.
+func TestPinnedClientSeesTheMinorityRefuse(t *testing.T) {
+	c := newCluster(t, 3, nil)
+	lead := c.leader()
+	ctx := ctxFor(t, 20*time.Second)
+	cl := c.client(ctx, client.Config{AttemptTimeout: 300 * time.Millisecond})
+
+	cl.Pin(c.others(lead)[0])
+	_, err := cl.Put(ctx, "k", []byte("via a follower"))
+	require.ErrorIs(t, err, client.ErrPinnedNotLeader)
+
+	c.isolate(lead)
+	cl.Pin(lead)
+	short, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	_, err = cl.Put(short, "k", []byte("via the cut-off leader"))
+	require.ErrorIs(t, err, client.ErrUnknownOutcome, "a minority leader acknowledged a write it cannot commit")
+
+	c.heal()
+	cl.Pin(raft.None)
+	got, err := cl.Get(ctx, "k")
+	require.NoError(t, err)
+	require.False(t, got.Found, "neither refused write may have been applied")
+}
+
+// TestClientEscapesAStaleMinority: the leader and one follower are cut off from
+// the other three. A client whose last-known leader is the stale one must still
+// get its write done through the majority. The trap is that the stale leader
+// times out, and its follower -- honestly -- redirects back to it. The first
+// version of the client followed that hint every time and never reached the
+// majority (BUGS.md, 2026-09-30).
+func TestClientEscapesAStaleMinority(t *testing.T) {
+	c := newCluster(t, 5, nil)
+	lead := c.leader()
+	follower := c.others(lead)[0]
+	var majority []raft.NodeID
+	for id := range c.nodes {
+		if id != lead && id != follower {
+			majority = append(majority, id)
+		}
+	}
+	ctx := ctxFor(t, 30*time.Second)
+	cl := c.client(ctx, client.Config{InitialLeader: lead, AttemptTimeout: 300 * time.Millisecond})
+
+	c.split([]raft.NodeID{lead, follower}, majority)
+	require.Eventually(t, func() bool { return c.leaderNow(majority...) != raft.None },
+		5*time.Second, testTick, "the majority never elected a leader")
+
+	for i := range 3 {
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		res, err := cl.Put(wctx, fmt.Sprintf("k%d", i), []byte("v"))
+		cancel()
+		require.NoError(t, err, "write %d never escaped the minority (%d attempts)", i, cl.LastAttempts())
+		t.Logf("write %d committed at %d after %d attempts, via node %d", i, res.AppliedIndex, cl.LastAttempts(), cl.Leader())
+		require.Contains(t, majority, cl.Leader())
+	}
 }

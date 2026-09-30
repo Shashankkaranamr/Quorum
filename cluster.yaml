@@ -14,11 +14,11 @@ cluster_id: quorum-local
 # five-node cluster that tolerates 2.
 nodes:
   # grpc_port serves the Raft peer transport, the client KV API and the admin
-  # API on one listener. http_port serves status and metrics, and is what the
-  # visualizer scrapes.
-  - {id: 1, host: 127.0.0.1, grpc_port: 7001, http_port: 8001}
-  - {id: 2, host: 127.0.0.1, grpc_port: 7002, http_port: 8002}
-  - {id: 3, host: 127.0.0.1, grpc_port: 7003, http_port: 8003}
+  # API on one listener. It is the node's only port; the visualizer reads each
+  # node's status from the admin API.
+  - {id: 1, host: 127.0.0.1, grpc_port: 7001}
+  - {id: 2, host: 127.0.0.1, grpc_port: 7002}
+  - {id: 3, host: 127.0.0.1, grpc_port: 7003}
 
 raft:
   # The consensus core counts ticks and has no clock of its own; the driver

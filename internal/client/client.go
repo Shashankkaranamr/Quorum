@@ -25,6 +25,11 @@ var (
 	// ErrSessionExpired means the cluster has no session for this client, so
 	// the write was not applied. Register again to continue.
 	ErrSessionExpired = errors.New("client: session expired; the write was not applied")
+
+	// ErrPinnedNotLeader means a pinned client's node is not the leader. The
+	// request definitely did not happen, and a pinned client does not follow
+	// the redirect.
+	ErrPinnedNotLeader = errors.New("client: the pinned node is not the leader")
 )
 
 // Config configures a Client.
@@ -58,6 +63,7 @@ type Client struct {
 	kvs   map[raft.NodeID]kvv1.KVClient
 
 	leader raft.NodeID
+	pin    raft.NodeID
 	id     uint64
 	seq    uint64
 
@@ -109,6 +115,11 @@ func (c *Client) ID() uint64 { return c.id }
 // Leader is the node the client currently believes leads.
 func (c *Client) Leader() raft.NodeID { return c.leader }
 
+// Pin sends every later request to node id alone: no redirects, no trying other
+// nodes. It is what a client stuck on one side of a partition experiences, and
+// it is how the visualizer shows a minority refusing writes. Zero unpins.
+func (c *Client) Pin(id raft.NodeID) { c.pin = id }
+
 // LastAttempts is how many RPCs the most recent call made, including the one
 // that succeeded. In a stable cluster it is 1, or 2 after a redirect.
 func (c *Client) LastAttempts() int { return c.attempts }
@@ -145,7 +156,17 @@ func (c *Client) do(ctx context.Context, write bool,
 	attempt func(ctx context.Context, kv kvv1.KVClient) (kvv1.Status, *kvv1.LeaderHint, error)) (kvv1.Status, error) {
 	c.attempts = 0
 	maybeApplied := false
+	// failed holds nodes that did not give a definite answer during this
+	// call. A redirect to one of them is not followed, and rotation tries
+	// the others first. Without it, a stale leader cut off with some
+	// followers traps the client: the leader times out, its followers
+	// honestly point back at it, and the majority is never tried (BUGS.md,
+	// 2026-09-30).
+	failed := map[raft.NodeID]bool{}
 	target := c.leader
+	if c.pin != raft.None {
+		target = c.pin
+	}
 	for {
 		c.attempts++
 		actx, cancel := context.WithTimeout(ctx, c.cfg.AttemptTimeout)
@@ -161,7 +182,10 @@ func (c *Client) do(ctx context.Context, write bool,
 			c.leader = target
 			return st, nil
 		case redirect:
-			if h := raft.NodeID(hint.GetNodeId()); h != raft.None && h != target && c.kvs[h] != nil {
+			if c.pin != raft.None {
+				return 0, fmt.Errorf("%w: node %d says node %d leads", ErrPinnedNotLeader, target, hint.GetNodeId())
+			}
+			if h := raft.NodeID(hint.GetNodeId()); h != raft.None && h != target && c.kvs[h] != nil && !failed[h] {
 				// A hint to a different node costs no backoff: that is
 				// what makes a redirect one extra round trip.
 				target = h
@@ -170,9 +194,14 @@ func (c *Client) do(ctx context.Context, write bool,
 			}
 		case ambiguous:
 			maybeApplied = maybeApplied || write
+			failed[target] = true
+		default: // unanswered: NO_QUORUM, or nothing learned
+			failed[target] = true
 		}
 
-		target = c.next(target)
+		if c.pin == raft.None {
+			target = c.next(target, failed)
+		}
 		select {
 		case <-ctx.Done():
 			if maybeApplied {
@@ -184,8 +213,17 @@ func (c *Client) do(ctx context.Context, write bool,
 	}
 }
 
-func (c *Client) next(id raft.NodeID) raft.NodeID {
+// next picks the node to try after id: the next one in order that has not
+// failed during this call. Once every node has failed, the slate is wiped --
+// the partition may have healed -- and rotation starts over.
+func (c *Client) next(id raft.NodeID, failed map[raft.NodeID]bool) raft.NodeID {
 	i := slices.Index(c.ids, id)
+	for k := 1; k <= len(c.ids); k++ {
+		if cand := c.ids[(i+k)%len(c.ids)]; !failed[cand] {
+			return cand
+		}
+	}
+	clear(failed)
 	return c.ids[(i+1)%len(c.ids)]
 }
 

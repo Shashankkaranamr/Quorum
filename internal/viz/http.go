@@ -38,7 +38,7 @@ func routes() []route {
 		{"POST /api/nodes/{id}/thaw", "admin Thaw, through supervisor.Thaw", (*Server).thaw},
 		{"POST /api/partition", "admin BlockLinks, through supervisor.Partition", (*Server).partition},
 		{"POST /api/heal", "admin Heal, through supervisor.Heal", (*Server).heal},
-		{"POST /api/put", "KV Put, through the client library", (*Server).put},
+		{"POST /api/put", "KV Put, through the client library (optionally pinned to one node)", (*Server).put},
 		{"POST /api/load", "KV Put in the background, through the client library", (*Server).load},
 	}
 }
@@ -271,21 +271,43 @@ func (s *Server) put(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Key   string `json:"key"`
 		Value string `json:"value"`
+		Via   uint64 `json:"via"` // optional: send only to this node
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Key == "" {
 		http.Error(w, "put: need a JSON body with a non-empty key", http.StatusBadRequest)
 		return
+	}
+	if body.Via != 0 {
+		if _, err := s.ids([]uint64{body.Via}); err != nil {
+			http.Error(w, "put: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
 	s.act(w, r, func(ctx context.Context) (string, error) {
 		cl, err := s.client(ctx)
 		if err != nil {
 			return "", err
 		}
-		res, err := cl.Put(ctx, body.Key, []byte(body.Value))
+		if body.Via == 0 {
+			res, err := cl.Put(ctx, body.Key, []byte(body.Value))
+			if err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("control|put %s at index %d", body.Key, res.AppliedIndex), nil
+		}
+		// Through one node only, no redirects: what a client on one side of a
+		// partition sees. A node in a minority cannot commit, so the answer
+		// is never success -- which is the point of showing it.
+		cl.Pin(raft.NodeID(body.Via))
+		defer cl.Pin(raft.None)
+		pctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		res, err := cl.Put(pctx, body.Key, []byte(body.Value))
 		if err != nil {
+			s.noteAsync(fmt.Sprintf("fault|put %s via node %d not acknowledged: %v", body.Key, body.Via, err))
 			return "", err
 		}
-		return fmt.Sprintf("control|put %s at index %d", body.Key, res.AppliedIndex), nil
+		return fmt.Sprintf("control|put %s via node %d at index %d", body.Key, body.Via, res.AppliedIndex), nil
 	})
 }
 

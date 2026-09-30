@@ -24,7 +24,7 @@ PROTOC_GEN_GRPC_VERSION?= latest
 
 .DEFAULT_GOAL := help
 
-.PHONY: help tools proto proto-check build test race cover vet lint fmt fmt-check ci run up down viz clean
+.PHONY: help tools proto proto-check build test faults race cover vet lint fmt fmt-check ci run up down viz clean
 
 help: ## Show available targets
 	@printf 'Quorum %s\n\n' '$(VERSION)'
@@ -49,6 +49,9 @@ build: ## Build every binary into bin/
 
 test: ## Run the test suite
 	$(GO) test ./...
+
+faults: ## Run only the real-process fault suite: kills, partitions, freezes, chaos
+	$(GO) test -count=1 -v ./test/integration/...
 
 # The race detector needs cgo and a 64-bit C compiler. That is the default on
 # Linux and macOS. On Windows it often is not -- an old 32-bit MinGW earlier on

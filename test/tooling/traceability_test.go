@@ -162,3 +162,56 @@ func TestTraceabilityCheckCatchesGaps(t *testing.T) {
 	require.Contains(t, joined, `"Hollow" names no test`)
 	require.Contains(t, joined, "TestImaginary, which does not exist")
 }
+
+// traceabilityTables is DESIGN.md §7's tables, as the README reproduces them:
+// every table row, with in-page links pointed at DESIGN.md.
+func traceabilityTables(design string) ([]string, error) {
+	sec7, err := between(design, "## 7.", "## 8.")
+	if err != nil {
+		return nil, err
+	}
+	var rows []string
+	for _, line := range strings.Split(strings.ReplaceAll(sec7, "\r\n", "\n"), "\n") {
+		if strings.HasPrefix(line, "|") {
+			rows = append(rows, strings.ReplaceAll(line, "](#", "](DESIGN.md#"))
+		}
+	}
+	return rows, nil
+}
+
+// TestReadmeCarriesTheTraceabilityTable is phase 8 acceptance criterion 3's
+// guard: the README must carry DESIGN.md §7's claim-to-test tables in full, so
+// the evidence a visitor sees first cannot quietly fall behind the design
+// document. Regenerate the README's copy rather than editing it by hand.
+func TestReadmeCarriesTheTraceabilityTable(t *testing.T) {
+	rows, err := traceabilityTables(readRepoFile(t, "DESIGN.md"))
+	require.NoError(t, err)
+	require.Greater(t, len(rows), 50, "found too few rows in DESIGN.md §7; the format changed")
+	missing := missingRows(rows, readRepoFile(t, "README.md"))
+	require.Empty(t, missing, "the README is missing, or has a different version of, these DESIGN.md §7 rows")
+}
+
+// missingRows lists the rows that do not appear, as whole lines, in doc.
+func missingRows(rows []string, doc string) []string {
+	doc = strings.ReplaceAll(doc, "\r\n", "\n")
+	var out []string
+	for _, row := range rows {
+		if !strings.Contains(doc, row+"\n") {
+			out = append(out, row)
+		}
+	}
+	return out
+}
+
+// TestReadmeCheckCatchesAStaleCopy is its negative control: the real README
+// with one row edited, as if DESIGN.md had been updated and the README not,
+// must be caught.
+func TestReadmeCheckCatchesAStaleCopy(t *testing.T) {
+	rows, err := traceabilityTables(readRepoFile(t, "DESIGN.md"))
+	require.NoError(t, err)
+	readme := strings.ReplaceAll(readRepoFile(t, "README.md"), "\r\n", "\n")
+	require.Empty(t, missingRows(rows, readme))
+	last := rows[len(rows)-1]
+	stale := strings.Replace(readme, last+"\n", "| a row nobody updated | `TestSomething` | 8 |\n", 1)
+	require.Equal(t, []string{last}, missingRows(rows, stale))
+}

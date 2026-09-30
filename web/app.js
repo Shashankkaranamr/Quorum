@@ -211,6 +211,7 @@ function renderCards(s) {
 function renderGroups(s) {
   const g = $("groups");
   if (g.childElementCount) return; // membership is static; build once
+  for (const n of s.nodes) $("via").append(el("option", { value: n.id }, `via node ${n.id} only`));
   g.append(el("span", { class: "hd" }, "node"), el("span", { class: "hd" }, "A"), el("span", { class: "hd" }, "B"));
   for (const n of s.nodes) {
     g.append(el("span", {}, `node ${n.id}`),
@@ -253,7 +254,7 @@ $("oneway").addEventListener("change", (e) => {
 $("heal").addEventListener("click", () => control("/api/heal"));
 $("putform").addEventListener("submit", (e) => {
   e.preventDefault();
-  control("/api/put", { key: $("key").value, value: $("value").value });
+  control("/api/put", { key: $("key").value, value: $("value").value, via: Number($("via").value) });
 });
 $("load").addEventListener("change", (e) => control("/api/load", { on: e.target.checked }));
 

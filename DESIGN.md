@@ -9,10 +9,13 @@ that would fail if the claim were untrue, or says which phase adds that test.
 Where it claims less than the reader might assume, it says so explicitly —
 see [§6, What this will and will not guarantee](#6-what-this-will-and-will-not-guarantee).
 
-**Status:** phase 7 of 8 complete. Sections 1–6 are decided. Where the
-implementation has since diverged from them, §10 records what changed and why;
-see [PLAN.md](PLAN.md) for the roadmap and [PROGRESS.md](PROGRESS.md) for where
-the work actually is.
+**Status:** complete — all eight phases. Sections 1–6 were written before any
+consensus code, and are kept as they were argued. Where the implementation
+proved them wrong, the text has been corrected in place and says so, pointing
+to §10, which records what changed, in which phase, and why. The original
+reasoning stays on the page, because "we changed our mind" is only checkable if
+you can see what the mind was. See [PLAN.md](PLAN.md) for how each phase's
+acceptance criteria were met and [PROGRESS.md](PROGRESS.md) for open items.
 
 ---
 
@@ -183,6 +186,7 @@ case p := <-proposeCh: n.Propose(p)
 }
 
 rd := n.Ready()
+storage.SaveSnapshot(rd.Snapshot)     // 0. only if one was received (§10, phase 4)
 storage.Append(rd.Entries)            // 1. buffered
 storage.SetHardState(rd.HardState)    // 2. buffered
 storage.Sync()                        // 3. THE fsync — exactly one per Ready
@@ -250,7 +254,7 @@ is bounded by fuzzing the decoder and by the torn-tail tests in phase 3.
 ```
 data/node-<id>/
   wal/000001.log            append-only segments, rolled at 16 MiB
-  snap/<index>-<term>.snap  state machine snapshots
+  snap/<index>-<term>.snap  state machine snapshots (both numbers zero-padded)
 ```
 
 `HardState` is written **inside the WAL**, not to a separate file. That avoids
@@ -351,8 +355,7 @@ change:
 
 ```go
 type Transport interface {
-	Send(to NodeID, m Message)
-	Recv() <-chan Message
+	Send(msgs []Message)   // Recv was dropped: see below, and §10 (phase 2)
 }
 
 type Storage interface {
@@ -365,6 +368,11 @@ type Storage interface {
 
 Ready-processing — steps 1–6 above — is itself a shared function, so the
 durability ordering is exercised by the fast tests too, not only end-to-end.
+
+*As built:* inbound delivery is not part of the interface. The simulator pushes
+messages straight into the core; the gRPC transport exposes a channel the real
+loop selects on. A `Recv` channel would have needed a goroutine in the
+single-threaded simulator (§10, phase 2).
 
 ### (a) Deterministic simulation — `internal/transport/inmem`, `internal/testutil`
 
@@ -527,7 +535,9 @@ twice.
 - **Session expiry can break exactly-once** for a client idle past the
   garbage-collection window. This is inherent to bounded session state — the
   Raft dissertation has the same caveat. It is reported as `SESSION_EXPIRED`
-  rather than hidden.
+  rather than hidden. *As built:* expiry is not implemented — sessions are
+  never collected — so this caveat does not yet arise, and `SESSION_EXPIRED`
+  means only "never registered" (§10, phase 5; deferred in §9).
 - **Reads are not deduplicated.** They are idempotent and are not logged.
 
 ---
@@ -583,8 +593,12 @@ Node *i* gets:
 | | |
 |---|---|
 | `grpc_port` | `7000+i` — Raft peer transport, KV API and admin API, three services on one listener |
-| `http_port` | `8000+i` — status and metrics; what the visualizer scrapes |
 | data dir | `data/node-<id>` |
+
+*As built:* a node has one port. An `http_port` for status and metrics was
+planned here, and removed in phase 8: the visualizer reads each node's status
+from the admin API's stream over gRPC, so nothing ever listened on it (§10,
+phase 8).
 
 The visualizer serves on `8080`. [`cluster-5.yaml`](cluster-5.yaml) is the
 five-node variant.
@@ -645,8 +659,8 @@ end-to-end script look green.
   shortcut: safety always holds; liveness holds only under partial synchrony.
 - **Partitions in the demo are transport-level, not kernel-level.** See §3.
 - **Freeze is cooperative, not `SIGSTOP`.** See §3.
-- **Session expiry can break exactly-once** for a sufficiently idle client. See
-  §4.
+- **Session expiry is not implemented**, so sessions are never collected. If it
+  is added, exactly-once will lapse for a sufficiently idle client (§4).
 - **No authentication or authorization** on the client API.
 
 ---
@@ -756,6 +770,9 @@ every test named anywhere in this section must exist in the repository.
 | Another web page cannot press the visualizer's buttons | `TestControlsRefuseCrossSiteRequests` | ✅ 7 |
 | The visualizer follows the config at 3 and 5 nodes | `TestShapeFollowsTheConfig` | ✅ 7 |
 | The status stream keeps streaming while a node is frozen | `TestWatchStatusStreamsLiveState` | ✅ 7 |
+| A client escapes a stale minority whose follower redirects back to the stale leader | `TestClientEscapesAStaleMinority`; the five-node run of `TestChaosSeeded` | ✅ 8 |
+| A client pinned to a minority is never told its write succeeded | `TestPinnedClientSeesTheMinorityRefuse` | ✅ 8 |
+| The README carries exactly this section's tables | `TestReadmeCarriesTheTraceabilityTable`, `TestReadmeCheckCatchesAStaleCopy` | ✅ 8 |
 
 ---
 
@@ -777,7 +794,9 @@ internal/
   client/                 client library: client_id, seq, retry, redirect
   supervisor/             spawn / kill / restart node processes
   config/                 cluster.yaml loading and validation
-  testutil/               cluster harness, invariant checkers, Porcupine model
+  viz/                    visualizer backend: status fan-in, SSE, controls
+  testutil/               simulator, invariant checkers
+    lincheck/             Porcupine model and workload, shared by both suites
 cmd/
   quorum-node/            one replica
   quorumctl/              operator CLI and fault injection
@@ -788,6 +807,7 @@ test/
   tooling/                tests about the build tooling itself
   integration/            real-process end-to-end suite
 web/                      visualizer frontend, served from embed.FS
+docs/walkthrough/         the recorded walkthrough of the visualizer
 ```
 
 `raft/` is top-level and exported while everything else is `internal/`. That is
@@ -815,14 +835,19 @@ Things considered and consciously left out, so that "we didn't think of it" and
 | TLS / peer authentication | Localhost only, no Byzantine model | Medium |
 | Kernel-level partitions | Needs elevation, not portable | Medium — a second fault-injection backend |
 | Multi-key transactions | Out of scope for a KV store demonstrating consensus | High |
+| CheckQuorum | A leader that has not heard from a majority would step down, bounding a cut-off leader's queued reads; availability, not safety (§10, phase 5) | Low — the leader already counts ticks since each peer last answered |
+| Session expiry | Needs a deterministic, replicated notion of "idle"; without it the session table grows with every registration | Medium — and it brings back the §4 caveat |
+| Automated browser tests of the visualizer | Every behaviour is tested at the SSE and HTTP layer the page consumes; the rendering was checked by eye (§10, phase 7) | Medium — a headless browser in CI |
 
 ---
 
 ## 10. Implementation deltas
 
-Where the code diverged from this document, and why. Recorded as it happens
+Where the code diverged from this document, and why. Recorded as it happened
 rather than reconciled at the end, so that "we changed our mind" and "we forgot"
-stay distinguishable. Phase 8 consolidates this into the body of the document.
+stay distinguishable. Phase 8 corrected the body wherever it had become wrong,
+each correction marked *As built* and pointing back here; the history itself
+stays here.
 
 ### Phase 2
 
@@ -1187,3 +1212,35 @@ acceptance test reads the same SSE stream the page renders, and drives the same
 POST routes its buttons use. The rendering itself was checked by eye in Chrome,
 against real 3- and 5-node clusters. There is no automated browser test, and
 this says so rather than implying one.
+
+### Phase 8
+
+**The body was corrected in place.** Every statement in §1–§9 that the
+implementation had made false now says what was built, marked *As built*, with
+a pointer to the phase above that explains it. Nothing that was argued and
+then abandoned was deleted.
+
+**`http_port` was removed.** It was planned for status and metrics that the
+visualizer would scrape. The visualizer ended up reading each node's admin
+stream over gRPC instead, so the port was validated, reserved and never
+listened on. A configured port nobody uses invites the reasonable guess that
+something is on it. The field is gone from the config, both cluster files, the
+binaries' output and the docs; strict decoding now rejects it, which is the
+right answer for a stale config.
+
+**The client does not trust a hint from a node that just failed to answer.**
+Recording the walkthrough found a client trapped in a stale minority: the
+cut-off leader times out, its follower honestly redirects back to it, and the
+majority is never tried. Within one call, a node that did not answer is no
+longer followed by redirect, and rotation tries untried nodes first (BUGS.md,
+2026-09-30). The chaos suite gained a five-node run whose isolations cut off a
+pair of nodes, the shape that exposed it.
+
+**`Client.Pin`** sends every request to one node, with no redirects and no
+rotation. It exists so a client on one side of a partition can be shown
+honestly: the visualizer's "via node N" writes use it, and
+`TestPinnedClientSeesTheMinorityRefuse` checks that a pinned write to a
+minority is never acknowledged.
+
+**`make faults`** runs only the real-process suite, so "one command runs the
+fault suite" is literally one command. `make ci` still runs it, twice.

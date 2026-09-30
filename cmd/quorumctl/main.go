@@ -224,10 +224,10 @@ func plan(args []string, stdout, stderr io.Writer) error {
 		len(c.Nodes), c.Quorum(), len(c.Nodes)-c.Quorum())
 
 	tw := tabwriter.NewWriter(stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintf(tw, "NODE\tGRPC\tHTTP\tDATA DIR\tCOMMAND\n")
+	fmt.Fprintf(tw, "NODE\tGRPC\tDATA DIR\tCOMMAND\n")
 	for _, n := range c.Nodes {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\tquorum-node -id %d -config %s\n",
-			n.ID, n.GRPCAddr(), n.HTTPAddr(), c.DataDir(n.ID), n.ID, *configPath)
+		fmt.Fprintf(tw, "%d\t%s\t%s\tquorum-node -id %d -config %s\n",
+			n.ID, n.GRPCAddr(), c.DataDir(n.ID), n.ID, *configPath)
 	}
 	_ = tw.Flush()
 
