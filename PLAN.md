@@ -16,7 +16,7 @@ a later phase is started before that.
 > we actually are** — what is built, what is verified, and what the next concrete
 > steps are. Check it before starting work.
 
-**Current status: phase 7 complete.**
+**Current status: complete — all eight phases.**
 
 | Phase | Title | Status |
 |---|---|---|
@@ -27,7 +27,7 @@ a later phase is started before that.
 | 5 | gRPC KV service, linearizable reads, deduplication | ✅ complete |
 | 6 | Fault-injection suite and bug log | ✅ complete |
 | 7 | Live cluster visualizer | ✅ complete |
-| 8 | Integration, documentation and demo | not started |
+| 8 | Integration, documentation and demo | ✅ complete |
 
 ---
 
@@ -589,7 +589,7 @@ The rendering is checked by eye only.
 
 ---
 
-## Phase 8 — Integration, documentation and demo
+## Phase 8 — Integration, documentation and demo ✅
 
 **Goal.** A stranger can clone the repo, run it, and evaluate the claims.
 
@@ -598,18 +598,46 @@ table; recorded walkthrough; reconciled DESIGN.md; `make ci` green end to end.
 
 **Acceptance criteria**
 
-1. **Two commands on a clean machine.** One brings up a cluster, one runs the
-   full fault suite. Verified from a fresh clone, documented in the README.
-2. **`make ci` is green**: format check, lint, build, unit tests, race detector
-   and the integration suite.
-3. **The README carries the evidence**: architecture diagram, the
-   guarantees/non-guarantees section, and the complete claim-to-test
-   traceability table.
-4. **A recorded walkthrough** of the visualizer showing, at minimum: a normal
-   election, a network partition with the minority refusing writes, and a leader
-   kill followed by recovery. No live link, no hosting.
-5. **`BUGS.md` is finalized** with at least three real entries, each naming its
-   regression test.
-6. **DESIGN.md is reconciled with reality.** Every place the implementation
-   diverged from the original design is noted with what changed and why. A
-   design document that was never wrong about anything was not load-bearing.
+1. ✅ **Two commands on a clean machine.** `make viz` brings up a cluster and
+   the visualizer; `make faults` (new this phase) runs the full real-process
+   fault suite. Both are in the README with their `make.ps1` equivalents. Both
+   were run from a fresh `git clone` of the committed tree: `make viz` built
+   everything, started three nodes, elected a leader and served the page;
+   `make faults` passed all 16 real-process tests in 151 s. *The limit of that
+   check, stated plainly:* it ran on the development machine (Windows 11), so
+   Go was installed and its module cache warm. It is a fresh clone, not a
+   fresh machine, and Linux and macOS were not tried.
+2. ✅ **`make ci` is green**: format check, lint, build, the whole test suite
+   including the integration suite, and all of it again under the race
+   detector, with the node processes themselves race-built.
+3. ✅ **The README carries the evidence**: an architecture diagram, the full
+   guarantees and non-guarantees with the honesty constraints, and DESIGN.md
+   §7's complete claim-to-test tables. `TestReadmeCarriesTheTraceabilityTable`
+   fails if the README's copy drifts from DESIGN.md's, with a negative
+   control, `TestReadmeCheckCatchesAStaleCopy`.
+4. ✅ **A recorded walkthrough**, [docs/walkthrough](docs/walkthrough/README.md):
+   eight captioned frames of the visualizer on a real five-node cluster,
+   driven only by the page's own buttons. They show a normal election, a
+   partition in which the minority refuses a write while the majority
+   commits, a heal that reconciles every log, and a leader kill followed by
+   recovery. It is frames rather than video, because a video export would
+   have been a browser download, which needs explicit permission. Recording it
+   found a real bug; the frames are from the re-recording after the fix.
+5. ✅ **`BUGS.md` is finalized**: eleven real entries, five of them in
+   production code, each naming a regression test observed failing before its
+   fix, with an index table at the top.
+6. ✅ **DESIGN.md is reconciled with reality.** Every body statement the
+   implementation had made false is corrected in place, marked *As built*,
+   pointing to §10, which records every divergence phase by phase. §9 gained
+   the deferrals that arose during implementation: CheckQuorum, session
+   expiry, and browser tests.
+
+**Also delivered**
+
+- A client liveness fix. A stale leader's follower redirected the client back
+  to the stale leader, trapping writes in a minority. The walkthrough found
+  it; `TestClientEscapesAStaleMinority` guards it. `TestChaosSeeded` gained a
+  five-node run that isolates pairs of nodes.
+- `http_port` removed. Nothing ever listened on it.
+- `Client.Pin`, and "via node N" writes in the visualizer, to show a
+  minority's refusal honestly.

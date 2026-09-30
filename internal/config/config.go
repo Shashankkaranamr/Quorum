@@ -43,7 +43,6 @@ func (n Node) GRPCAddr() string {
 	return net.JoinHostPort(n.Host, strconv.Itoa(n.GRPCPort))
 }
 
-
 // RaftParams are the consensus timing and sizing knobs.
 //
 // Timing is expressed in logical ticks rather than milliseconds everywhere

@@ -26,6 +26,10 @@ fixing.
 
 ## 2. Phase discipline — the single easiest way to get this wrong
 
+*All eight phases are complete.* The discipline below is how the project was
+built, and still applies to any follow-on work: one scoped piece at a time,
+done when its criteria pass and `make ci` is green.
+
 The project is built in **8 phases, one per user prompt**. The user pastes one
 phase at a time.
 
@@ -169,6 +173,8 @@ make race        # test suite under the race detector
 make lint        # go vet + golangci-lint
 make ci          # fmt-check + lint + build + test + race
 make run         # print the cluster plan and one node's config
+make viz         # start the cluster and serve the visualizer on :8080
+make faults      # run only the real-process fault suite
 make proto       # regenerate protobuf code (needs `make tools` once)
 ```
 
@@ -237,6 +243,12 @@ Things that will waste a cycle if you do not know them:
 - **`test/integration` runs real processes and takes minutes**, twice in
   `make ci` (plain and under `-race`). `go test -short ./...` skips it.
   `QUORUM_CHAOS_SEED=n` replays one chaos seed.
+- **The README's traceability tables are generated from DESIGN.md §7.** Edit
+  DESIGN.md, then copy the tables across; `TestReadmeCarriesTheTraceabilityTable`
+  fails if the two differ.
+- **Test partitions of one node miss bugs that need two.** A stale leader with
+  a follower behind it behaves differently from a lone one (BUGS.md,
+  2026-09-30). Use five nodes when the minority's size matters.
 - **Real-time tests must wait for a leader, not sample one.** Leadership is in
   flux for a moment after any fault, and status calls time out on a loaded
   machine. Use the harnesses' `leader()`, which waits, rather than a

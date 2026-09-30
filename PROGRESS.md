@@ -13,12 +13,12 @@ updated at the end of every phase.
 
 | | |
 |---|---|
-| **Current phase** | **7 of 8 — complete** |
-| **Next phase** | 8 — integration, documentation and demo |
+| **Current phase** | **8 of 8 — complete** |
+| **Next phase** | none: the plan is finished |
 | **Last updated** | 2026-09-30 |
 | **Branch** | `main` at `github.com/Shashankkaranamr/Quorum` |
 | **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~350s end to end, cold cache) |
-| **Tests** | 152 test and fuzz functions across 13 packages, all passing |
+| **Tests** | 156 test and fuzz functions across 13 packages, all passing |
 | **Go** | 1.27.0 |
 
 > **A replicated key-value store you can break on purpose.** Three to five
@@ -30,8 +30,9 @@ updated at the end of every phase.
 > rolling restarts, that a minority refuses writes and reconciles exactly, and
 > that seeded chaos stays linearizable. Every guarantee in DESIGN.md §6 names
 > tests, and a tooling test enforces it. `quorum-viz` (`make viz`) shows the
-> cluster live and drives the same faults from a browser. What is left is the
-> final write-up and demo recording (phase 8).
+> cluster live and drives the same faults from a browser. The README carries
+> the evidence, docs/walkthrough the recorded demo, and `make viz` / `make
+> faults` are the two commands a newcomer needs. The plan is complete.
 
 ---
 
@@ -46,7 +47,7 @@ updated at the end of every phase.
 | 5 | gRPC KV service, linearizable reads, deduplication | ✅ **complete** |
 | 6 | Fault-injection suite and bug log | ✅ **complete** |
 | 7 | Live cluster visualizer | ✅ **complete** |
-| 8 | Integration, documentation and demo | ⬜ next |
+| 8 | Integration, documentation and demo | ✅ **complete** |
 
 Acceptance criteria for each phase are in [PLAN.md](PLAN.md). A phase is done
 when all of them pass and `make ci` is green.
@@ -91,7 +92,7 @@ a package** - it is the spec.
 
 ## What is actually verified
 
-152 test and fuzz functions across 13 packages. What each group proves:
+156 test and fuzz functions across 13 packages. What each group proves:
 
 **The consensus core stays pure** - `raft/purity_test.go`
 
@@ -363,10 +364,6 @@ Nothing is blocking phase 7. Carried forward:
 - **Session expiry is not implemented.** Sessions are never collected.
 - **PID ownership can only be checked on Windows and Linux.** Elsewhere a stale
   PID file could name a stranger; DESIGN.md §10.
-- **`http_port` still serves nothing.** The visualizer ended up reading each
-  node's admin stream over gRPC, so no node needs an HTTP endpoint. The
-  configured port is validated but unused; phase 8 should either drop it from
-  the config or say why it stays.
 - **No automated browser test for the visualizer's page.** Everything it
   shows and does is tested at the SSE and HTTP layer; the rendering was
   checked by eye.
@@ -394,30 +391,17 @@ Nothing is blocking phase 7. Carried forward:
 
 ---
 
-## Next: phase 8
+## Next
 
-**Goal.** A stranger can clone the repo, run it, and evaluate the claims.
+The eight-phase plan is complete. If work continues, the open items above are
+the honest list, roughly in order of value:
 
-Full acceptance criteria: [PLAN.md](PLAN.md).
-
-What phase 7 left in place:
-
-1. `make viz` brings a cluster up and shows it; `make ci` already runs the
-   full fault suite (`test/integration`) as part of `make test` and
-   `make race`. Criterion 1 ("two commands") may only need documenting, and a
-   fresh-clone check.
-2. DESIGN.md §10 records every divergence phase by phase. Phase 8 consolidates
-   it into the body, as §10's introduction promises.
-3. The walkthrough can be recorded against `make viz`: a normal election, a
-   partition with the minority refusing writes, a leader kill and recovery.
-   All three work from the page today.
-
-Watch for:
-
-- `http_port` is configured but unused. Drop it or explain it.
-- The README must carry the traceability table and the honesty constraints
-  (CLAUDE.md §8) verbatim in spirit: transport-level partitions, cooperative
-  freeze.
+1. CheckQuorum, so a cut-off leader steps down instead of queueing reads.
+2. Pre-vote, so a returning node cannot disrupt an election.
+3. Session expiry, which brings back §4's exactly-once caveat and needs a
+   deterministic notion of "idle".
+4. A CI runner, and a genuinely fresh-machine run on Linux and macOS.
+5. Chasing the one unexplained `make ci` failure from phase 6, if it recurs.
 
 ---
 
@@ -608,3 +592,28 @@ writes, then killing the leader. That check found and fixed a label
 overlapping its links. No bugs were found this phase, and BUGS.md says so.
 
 Verified: `make ci` green, `buf breaking` clean.
+
+### Phase 8 - 2026-09-30
+
+Made the project evaluable by a stranger:
+- The README now leads with the evidence: an architecture diagram, the
+  guarantees and non-guarantees, and DESIGN.md §7's full claim-to-test tables,
+  kept identical by a tooling test that has a negative control.
+- `make faults` was added, so the fault suite is one command. Both README
+  commands were verified from a fresh clone; see PLAN.md for exactly what that
+  does and does not show.
+- DESIGN.md's body was corrected in place wherever it had become false.
+- `http_port` was removed, because nothing ever listened on it.
+- BUGS.md got an index.
+
+Recorded the walkthrough (docs/walkthrough) on a real five-node cluster
+through the visualizer's own buttons. The first recording found a real bug: a
+stale leader's follower redirected the client back to it, trapping writes in a
+minority that could never commit. The client now ignores hints to nodes that
+just failed to answer. `TestClientEscapesAStaleMinority` reproduced the bug
+and guards the fix (it failed 2 of 3 before the fix, passed 5 of 5 after), and
+`TestChaosSeeded` gained a five-node run that isolates pairs. The walkthrough
+was then re-recorded.
+
+Verified: `make ci` green, `make viz` and `make faults` green from a fresh
+clone, and `buf breaking` clean.
