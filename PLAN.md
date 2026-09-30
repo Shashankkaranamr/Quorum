@@ -16,7 +16,7 @@ a later phase is started before that.
 > we actually are** — what is built, what is verified, and what the next concrete
 > steps are. Check it before starting work.
 
-**Current status: phase 6 complete.**
+**Current status: phase 7 complete.**
 
 | Phase | Title | Status |
 |---|---|---|
@@ -26,7 +26,7 @@ a later phase is started before that.
 | 4 | Snapshotting and log compaction | ✅ complete |
 | 5 | gRPC KV service, linearizable reads, deduplication | ✅ complete |
 | 6 | Fault-injection suite and bug log | ✅ complete |
-| 7 | Live cluster visualizer | not started |
+| 7 | Live cluster visualizer | ✅ complete |
 | 8 | Integration, documentation and demo | not started |
 
 ---
@@ -520,30 +520,72 @@ streaming while the node is frozen).
 
 ---
 
-## Phase 7 — Live cluster visualizer
+## Phase 7 — Live cluster visualizer ✅
 
 **Goal.** Behaviour under failure is something you can watch, not just claim.
 
 **Deliverables.** `cmd/quorum-viz/` (supervisor + SSE aggregator), `web/`
 frontend served from `embed.FS`, `WatchStatus` streaming.
 
+**Delivered.**
+- `internal/viz`, the backend. It fans in every node's `WatchStatus`
+  stream, rebuilds one picture of the cluster every 100 ms, and pushes it to
+  browsers over server-sent events. It turns a fixed table of POST routes into
+  supervisor, admin and KV calls. It takes no locks: one goroutine owns the
+  picture, another runs controls one at a time.
+- `web/`: vanilla JS and CSS embedded in the binary. It shows a topology with
+  each directed link drawn separately, node cards with log tails aligned by
+  index, a partition builder, and an event timeline.
+- `cmd/quorum-viz`, and `make viz`.
+- Admin status gained `blocked_outbound` and `blocked_inbound`, so the UI can
+  draw a one-way cut. These are new field numbers; `buf breaking` is clean.
+- Partition, heal, freeze and thaw moved onto the supervisor, so `quorumctl`,
+  the visualizer and the tests share one implementation.
+
 **Acceptance criteria**
 
-1. **Live state per node.** Role, term, `commitIndex`, `lastApplied`, leader,
-   and a log tail, updating within **500 ms** of a change. Entries visibly
-   replicate across nodes.
-2. **"Kill node" is a real kill.** The OS process terminates — verified by PID
-   absence, not by a UI state change — and "restart" brings it back from its
-   existing data directory.
-3. **"Partition network" is a real transport-level cut**, and the UI shows which
-   directed links are down. One-way partitions are expressible.
-4. **An election is legible.** Killing the leader produces a visible term bump
-   and a new leader within one refresh, with the old leader shown as
-   unreachable.
-5. **The UI cannot corrupt the cluster.** All controls go through the admin API;
-   there is no path from the browser to Raft state that bypasses it.
-6. **Works at 3 and 5 nodes**, driven by `cluster.yaml` and `cluster-5.yaml`
-   with no code change.
+1. ✅ **Live state per node.** `TestVizShowsLiveState`, on real processes at 3
+   and 5 nodes, reads only the SSE stream a browser reads. It requires each
+   node's role, term, leader, commit, applied and log tail. A write made
+   through the page must appear committed in every node's log tail within
+   500 ms of returning: observed 145–195 ms.
+2. ✅ **"Kill node" is a real kill.** `TestVizKillIsRealAndRestartRecovers`
+   presses kill over HTTP, then checks with the operating system, not the
+   page, that the PID is gone. "Start" brings back a new process with at least
+   the log it had on disk.
+3. ✅ **"Partition network" is a real transport-level cut.**
+   `TestVizShowsDirectedPartitions` makes a one-way cut from the page. It
+   confirms the cut on the node's own admin API: outbound blocked, inbound
+   not. The stream must show exactly that one directed link down. It then
+   checks a two-way cut and a heal.
+4. ✅ **An election is legible.** `TestVizMakesElectionsLegible` kills the
+   leader from the page. The stream shows it down within 15 ms, then a new
+   leader in a higher term about 520 ms after the kill. That time is mostly
+   the election itself; the page shows the new leader within one refresh of
+   the cluster having one. The old leader stays shown as down, with its last
+   report marked stale, and the election is on the timeline.
+5. ✅ **The UI cannot corrupt the cluster.** This holds by structure: the nodes
+   are separate processes, reachable only over RPC.
+   - `TestVizCannotReachRaftState` fails if `internal/viz`, `cmd/quorum-viz`
+     or `web` ever depends on a package holding node state. Its negative
+     control, `TestNodeStateCheckFlagsANodeAssembly`, must flag
+     `internal/node`.
+   - `TestRoutesAreExactlyTheDocumentedControls` pins every route and the
+     call it makes.
+   - `TestControlsRefuseCrossSiteRequests`: other web pages cannot press the
+     buttons.
+6. ✅ **Works at 3 and 5 nodes.** `TestShapeFollowsTheConfig` loads the
+   repository's own `cluster.yaml` and `cluster-5.yaml` and gets 3 and 5 nodes
+   with 6 and 20 directed links. Criterion 1's test runs live at both sizes.
+
+**Also checked by eye.** The page was opened in Chrome against a real
+three-node cluster from `cluster.yaml`. It showed "live", the leader and term,
+and all six directed links. Node labels were then moved outward from the ring,
+because the top node's label overlapped its links.
+
+**Not done, and why.** There are no automated browser tests. Every behaviour
+above is tested at the HTTP and SSE layer, which is what the page consumes.
+The rendering is checked by eye only.
 
 ---
 

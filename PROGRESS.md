@@ -13,12 +13,12 @@ updated at the end of every phase.
 
 | | |
 |---|---|
-| **Current phase** | **6 of 8 — complete** |
-| **Next phase** | 7 — live cluster visualizer |
+| **Current phase** | **7 of 8 — complete** |
+| **Next phase** | 8 — integration, documentation and demo |
 | **Last updated** | 2026-09-30 |
 | **Branch** | `main` at `github.com/Shashankkaranamr/Quorum` |
-| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~320s end to end, cold cache) |
-| **Tests** | 140 test and fuzz functions across 12 packages, all passing |
+| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~350s end to end, cold cache) |
+| **Tests** | 152 test and fuzz functions across 13 packages, all passing |
 | **Go** | 1.27.0 |
 
 > **A replicated key-value store you can break on purpose.** Three to five
@@ -29,8 +29,9 @@ updated at the end of every phase.
 > real-process suite shows that acknowledged writes survive leader kills and
 > rolling restarts, that a minority refuses writes and reconciles exactly, and
 > that seeded chaos stays linearizable. Every guarantee in DESIGN.md §6 names
-> tests, and a tooling test enforces it. What is left is the live visualizer
-> (phase 7) and the final write-up (phase 8).
+> tests, and a tooling test enforces it. `quorum-viz` (`make viz`) shows the
+> cluster live and drives the same faults from a browser. What is left is the
+> final write-up and demo recording (phase 8).
 
 ---
 
@@ -44,8 +45,8 @@ updated at the end of every phase.
 | 4 | Snapshotting and log compaction | ✅ **complete** |
 | 5 | gRPC KV service, linearizable reads, deduplication | ✅ **complete** |
 | 6 | Fault-injection suite and bug log | ✅ **complete** |
-| 7 | Live cluster visualizer | ⬜ next |
-| 8 | Integration, documentation and demo | ⬜ not started |
+| 7 | Live cluster visualizer | ✅ **complete** |
+| 8 | Integration, documentation and demo | ⬜ next |
 
 Acceptance criteria for each phase are in [PLAN.md](PLAN.md). A phase is done
 when all of them pass and `make ci` is green.
@@ -73,13 +74,14 @@ when all of them pass and `make ci` is green.
 | `proto/`, `gen/` | Schemas and checked-in generated code. `buf lint` clean. |
 | `internal/supervisor/` | **Real processes**: spawn detached, record PIDs, kill with TerminateProcess/SIGKILL and confirm the PID is gone. Refuses to act on a PID that now belongs to another program (Windows and Linux). |
 | `internal/admin/` | **The Admin API**: status from the loop's published snapshot (so a frozen node still answers), `WatchStatus`, directed `BlockLinks`, `Heal`, `Freeze`/`Thaw`. |
+| `internal/viz/`, `web/`, `cmd/quorum-viz` | **The live visualizer**: fans in every node's status stream, pushes one picture to the browser over SSE every 100 ms when it changes, and turns a fixed table of POST routes into supervisor, admin and KV calls. Vanilla JS frontend embedded in the binary. No locks: one goroutine owns the picture, one runs controls. |
 | `internal/testutil/lincheck/` | The Porcupine model, history recorder and workload, shared by the in-process and real-process linearizability tests. |
 | `cmd/quorum-node` | Serves until SIGINT/SIGTERM. `-describe` prints its configuration and exits (what `make run` uses). |
 | `cmd/quorumctl` | Every subcommand works: `plan`, `up`, `down`, `status`, `kill`, `start`, `freeze`, `thaw`, `partition [-oneway]`, `heal`, `put`, `get`. |
 
 ### Documented stubs (a `doc.go` each, no logic)
 
-`cmd/quorum-viz/` (phase 7)
+None left.
 
 Each `doc.go` states the package's responsibility, the invariants it must
 uphold, and the phase that fills it in. **Read the `doc.go` before implementing
@@ -89,7 +91,7 @@ a package** - it is the spec.
 
 ## What is actually verified
 
-140 test and fuzz functions across 12 packages. What each group proves:
+152 test and fuzz functions across 13 packages. What each group proves:
 
 **The consensus core stays pure** - `raft/purity_test.go`
 
@@ -139,6 +141,22 @@ a package** - it is the spec.
   every committed entry (84 to 116 per run) re-applied identically everywhere.
 - `TestWALAgreesWithMemStorage`: the simulator's crash model and the real log
   agree after reopening.
+
+**The visualizer** - `internal/viz/`, `test/integration/viz_test.go`
+
+- `TestVizShowsLiveState`: at 3 and 5 nodes, a write made from the page is
+  committed in every node's log tail on the stream 145–195 ms after it
+  returns (bound 500 ms).
+- `TestVizKillIsRealAndRestartRecovers`: the page's kill leaves no process,
+  checked with the OS; its start recovers from disk.
+- `TestVizShowsDirectedPartitions`: a one-way cut from the page is confirmed on
+  the node's own admin API and drawn as exactly one directed link.
+- `TestVizMakesElectionsLegible`: old leader shown down in about 15 ms; new
+  leader in a higher term about 520 ms after the kill; on the timeline.
+- `TestVizCannotReachRaftState`, `TestRoutesAreExactlyTheDocumentedControls`,
+  `TestControlsRefuseCrossSiteRequests`, `TestShapeFollowsTheConfig`.
+- Checked by eye in Chrome against real 3- and 5-node clusters: kill,
+  background writes and an election.
 
 **Faults on real processes** - `test/integration/`, `internal/supervisor/`, `internal/server/loop_test.go`
 
@@ -252,6 +270,8 @@ Per [CLAUDE.md](CLAUDE.md), a checker nobody has seen fail is not evidence.
 | PID-ownership check | a PID file naming this test's own live process: ignored, not killed |
 | Kill verification | the PID is asserted alive immediately before the kill |
 | Tick-lag metric | a five-tick fsync must show lag (and a fast disk must not); the pre-fix loop showed 0 |
+| Viz import check | the same check run on `internal/node` must flag `internal/server` and `internal/storage` |
+| Viz cross-site guard | a POST without the control header, or with a foreign Origin, is refused |
 | Race scan of node logs | `TestNodesAreRaceCheckedUnderRace`: the node binary really carries `-race` when the tests do |
 
 `TestCheckerAcceptsAHealthyHistory` is the other half for the Raft checkers,
@@ -343,7 +363,13 @@ Nothing is blocking phase 7. Carried forward:
 - **Session expiry is not implemented.** Sessions are never collected.
 - **PID ownership can only be checked on Windows and Linux.** Elsewhere a stale
   PID file could name a stranger; DESIGN.md §10.
-- **`http_port` serves nothing yet.** Phase 7.
+- **`http_port` still serves nothing.** The visualizer ended up reading each
+  node's admin stream over gRPC, so no node needs an HTTP endpoint. The
+  configured port is validated but unused; phase 8 should either drop it from
+  the config or say why it stays.
+- **No automated browser test for the visualizer's page.** Everything it
+  shows and does is tested at the SSE and HTTP layer; the rendering was
+  checked by eye.
 - **Snapshots live in memory**, and the WAL keeps the post-snapshot log in
   memory. Both bounded by compaction; fine for a demo-sized store.
 - **No compaction margin.** A slightly-behind follower gets a snapshot.
@@ -368,33 +394,30 @@ Nothing is blocking phase 7. Carried forward:
 
 ---
 
-## Next: phase 7
+## Next: phase 8
 
-**Goal.** Behaviour under failure is something you can watch, not just claim.
+**Goal.** A stranger can clone the repo, run it, and evaluate the claims.
 
 Full acceptance criteria: [PLAN.md](PLAN.md).
 
-What phase 6 left in place:
+What phase 7 left in place:
 
-1. `admin.WatchStatus` streams each node's role, term, indices, peers (with
-   which links are blocked by injection), log tail with summaries, metrics
-   and frozen flag, and keeps streaming while a node is frozen
-   (`TestWatchStatusStreamsLiveState`). The visualizer's backend can fan
-   these in and forward them over SSE.
-2. Every control the UI needs already exists behind a tested path:
-   `supervisor.Kill`/`Start`, and `BlockLinks`/`Heal`/`Freeze`/`Thaw` on the
-   admin API. `cmd/quorumctl/operate.go` shows the calls. Criterion 5 ("the
-   UI cannot corrupt the cluster") holds if the backend uses only these.
-3. `test/integration`'s harness already starts clusters from a generated
-   config at 3 or 5 nodes; phase 7's criterion 6 can reuse it.
+1. `make viz` brings a cluster up and shows it; `make ci` already runs the
+   full fault suite (`test/integration`) as part of `make test` and
+   `make race`. Criterion 1 ("two commands") may only need documenting, and a
+   fresh-clone check.
+2. DESIGN.md §10 records every divergence phase by phase. Phase 8 consolidates
+   it into the body, as §10's introduction promises.
+3. The walkthrough can be recorded against `make viz`: a normal election, a
+   partition with the minority refusing writes, a leader kill and recovery.
+   All three work from the page today.
 
 Watch for:
 
-- `ms_since_last_contact` is only known on the leader (-1 elsewhere), so
-  "unreachable" for the UI should come from the leader's view plus the
-  injected-block flags, and from the supervisor for dead processes.
-- The honesty constraints in CLAUDE.md §8 apply to the UI's labels too: a
-  partition is transport-level, a freeze is cooperative.
+- `http_port` is configured but unused. Drop it or explain it.
+- The README must carry the traceability table and the honesty constraints
+  (CLAUDE.md §8) verbatim in spirit: transport-level partitions, cooperative
+  freeze.
 
 ---
 
@@ -560,3 +583,28 @@ node processes now run with the race detector too, and reported no races.
 Verified: `make ci` green, every new check observed failing on a deliberately
 broken input, the integration suite repeated three times under `-race`, and the
 12-seed chaos soak.
+
+### Phase 7 - 2026-09-30
+
+Built the live visualizer:
+- `internal/viz` fans in every node's `WatchStatus` stream and pushes one
+  picture to browsers over SSE.
+- A vanilla-JS page embedded in `quorum-viz` draws the topology with every
+  directed link separate, shows node cards with index-aligned log tails, and
+  keeps a timeline of elections, kills and faults.
+- The page's buttons go only through the supervisor, admin and KV APIs.
+- `make viz` starts the cluster if needed and serves the page.
+
+Admin status gained per-direction link flags so one-way cuts can be drawn, and
+partition, heal, freeze and thaw moved onto the supervisor so the CLI, the UI
+and the tests share them. The visualizer's controls refuse cross-site
+requests.
+
+All six criteria are tested on real processes, reading the same SSE stream the
+page renders. The "cannot corrupt the cluster" criterion is enforced
+structurally: an import check (with a negative control) and a pinned route
+table. The page was also exercised by eye in Chrome at 5 nodes: background
+writes, then killing the leader. That check found and fixed a label
+overlapping its links. No bugs were found this phase, and BUGS.md says so.
+
+Verified: `make ci` green, `buf breaking` clean.

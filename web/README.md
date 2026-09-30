@@ -1,19 +1,37 @@
 # Visualizer frontend
 
-Reserved for **phase 7**. Currently empty.
+The live cluster visualizer's page: `index.html`, `app.js`, `style.css`,
+embedded into the `quorum-viz` binary by `embed.go`. Run it with `make viz`
+(or `.\make.ps1 viz`) and open http://127.0.0.1:8080.
 
-The live cluster visualizer: current leader, terms, and log entries replicating
-in real time, with "kill node" and "partition network" controls.
+**Vanilla JS plus server-sent events.** No npm, no bundler, no build step —
+one binary. This was a deliberate choice over React: the page renders a
+topology diagram, a handful of node cards and a timeline, and a toolchain would
+cost more than it returns.
 
-**Vanilla JS plus server-sent events, served from `embed.FS` inside
-`cmd/quorum-viz`.** No npm, no bundler, no build step — one binary. This was a
-deliberate choice over React: the page renders a handful of node cards and a log
-list, and a toolchain would cost more than it returns. Assets in this directory
-are embedded directly.
+What the page shows, all from one stream (`/api/events`):
 
-Every control goes through the admin API (`proto/quorum/admin/v1`), which is the
-same API the fault-injection suite drives. There is no path from the browser to
-Raft state that bypasses it, so the UI cannot corrupt the cluster — and what the
-demo shows cannot drift from what the tests exercise.
+- **Topology.** Every directed link is its own arrow, so a one-way partition is
+  one red dashed arrow beside a green one. A node's colour is its role; grey
+  means its process is gone or it is not answering; a dashed blue ring means
+  frozen.
+- **Node cards.** Role, term, leader, commit, applied, last index, snapshot
+  index, tick lag, fsync p99 and elections started, plus the log tail —
+  aligned by index across cards, coloured by term, hollow until committed — so
+  an entry can be watched appearing on the leader and then on each follower.
+- **Timeline.** Elections, processes going and coming, faults injected and
+  healed.
 
-Acceptance criteria: [PLAN.md § Phase 7](../PLAN.md#phase-7--live-cluster-visualizer).
+Every button is a POST to one of the controls in
+[`internal/viz/http.go`](../internal/viz/http.go), which reach the cluster only
+through the supervisor (processes) and the admin and KV APIs — the same calls
+`quorumctl` and the fault-injection suite make. There is no path from the
+browser to Raft state that bypasses them; `TestVizCannotReachRaftState` and
+`TestRoutesAreExactlyTheDocumentedControls` enforce it. Controls also require
+a custom request header, so another web page cannot press them through your
+browser.
+
+The labels keep the project's honesty constraints: a partition is cut in each
+node's transport, not by a kernel firewall, and a freeze parks the node's loop
+cooperatively — it is not `SIGSTOP`. A kill is a real `TerminateProcess` /
+`SIGKILL`.

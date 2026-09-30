@@ -100,8 +100,10 @@ func (s *Service) status(tailLimit uint32) *adminv1.NodeStatus {
 		if p == s.cfg.ID {
 			continue
 		}
-		blocked := slices.Contains(out2, p) || slices.Contains(in, p)
-		pv := &adminv1.PeerView{NodeId: uint64(p), BlockedByInjection: blocked, MsSinceLastContact: -1, Reachable: !blocked}
+		bOut, bIn := slices.Contains(out2, p), slices.Contains(in, p)
+		blocked := bOut || bIn
+		pv := &adminv1.PeerView{NodeId: uint64(p), BlockedByInjection: blocked, BlockedOutbound: bOut,
+			BlockedInbound: bIn, MsSinceLastContact: -1, Reachable: !blocked}
 		// Only a leader hears from every peer regularly, so only a leader
 		// can say how recently it did. Elsewhere reachability is what the
 		// injector knows, and ms_since_last_contact is -1: unknown.

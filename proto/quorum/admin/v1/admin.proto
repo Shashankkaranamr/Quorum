@@ -38,6 +38,12 @@ message PeerView {
   // fault injector" from "this link is just down", which matters when reading
   // the visualizer but must never be visible to the consensus core.
   bool blocked_by_injection = 6;
+
+  // The two directions of blocked_by_injection, separately: outbound is this
+  // node -> peer, inbound is peer -> this node. A one-way partition sets one
+  // and not the other, and the visualizer draws each directed link from them.
+  bool blocked_outbound = 7;
+  bool blocked_inbound = 8;
 }
 
 // LogEntryView is a display-sized summary of a log entry. The raw payload is

@@ -9,7 +9,7 @@ that would fail if the claim were untrue, or says which phase adds that test.
 Where it claims less than the reader might assume, it says so explicitly —
 see [§6, What this will and will not guarantee](#6-what-this-will-and-will-not-guarantee).
 
-**Status:** phase 6 of 8 complete. Sections 1–6 are decided. Where the
+**Status:** phase 7 of 8 complete. Sections 1–6 are decided. Where the
 implementation has since diverged from them, §10 records what changed and why;
 see [PLAN.md](PLAN.md) for the roadmap and [PROGRESS.md](PROGRESS.md) for where
 the work actually is.
@@ -747,6 +747,15 @@ every test named anywhere in this section must exist in the repository.
 | Random fault schedules stay linearizable | `TestChaosSeeded` | ✅ 6 |
 | A recorded PID is never acted on once it belongs to another program | `TestSupervisorIgnoresAStrangersPID` | ✅ 6 |
 | This traceability section names only tests that exist, and covers every guarantee | `TestEveryGuaranteeNamesExistingTests`, `TestTraceabilityCheckCatchesGaps` | ✅ 6 |
+| The visualizer shows each node's live state, a write reaching every node within 500ms | `TestVizShowsLiveState` (3 and 5 nodes) | ✅ 7 |
+| The visualizer's kill is a real kill, and its start recovers from disk | `TestVizKillIsRealAndRestartRecovers` | ✅ 7 |
+| The visualizer's partitions are real transport cuts, drawn per direction | `TestVizShowsDirectedPartitions` | ✅ 7 |
+| An election is legible in the visualizer | `TestVizMakesElectionsLegible` | ✅ 7 |
+| The visualizer cannot reach Raft state except through the admin and KV APIs | `TestVizCannotReachRaftState`, `TestRoutesAreExactlyTheDocumentedControls` | ✅ 7 |
+| That structural check can actually fail | `TestNodeStateCheckFlagsANodeAssembly` | ✅ 7 |
+| Another web page cannot press the visualizer's buttons | `TestControlsRefuseCrossSiteRequests` | ✅ 7 |
+| The visualizer follows the config at 3 and 5 nodes | `TestShapeFollowsTheConfig` | ✅ 7 |
+| The status stream keeps streaming while a node is frozen | `TestWatchStatusStreamsLiveState` | ✅ 7 |
 
 ---
 
@@ -1137,3 +1146,44 @@ test logs the schedule. `QUORUM_CHAOS_SEED` reruns one seed and
 a guarantee lacks a row or a named test does not exist. Durability across
 **OS** crashes is the one half-claim no test here can exercise, and its row
 says so rather than implying otherwise.
+
+### Phase 7
+
+**The admin API reports each link's two directions.** `PeerView` gained
+`blocked_outbound` and `blocked_inbound`, beside the combined
+`blocked_by_injection`, so the visualizer can draw a one-way partition as one
+cut arrow rather than a cut pair. These are new field numbers; `buf breaking`
+is clean.
+
+**Fault injection lives on the supervisor.** Partition, heal, freeze and thaw
+moved from `quorumctl` onto `supervisor.Supervisor`. `quorumctl`, the
+visualizer and the integration tests now inject every fault through one
+implementation, which is the point §5 makes about the demo and the tests not
+drifting apart.
+
+**"The UI cannot corrupt the cluster" is enforced by structure, not care.**
+The nodes are separate processes, so the visualizer can only reach them over
+RPC, through what it imports. `TestVizCannotReachRaftState` fails if
+`internal/viz`, `cmd/quorum-viz` or `web` ever depend on a package that holds
+node state. `TestRoutesAreExactlyTheDocumentedControls` pins every HTTP route
+and says which supervisor, admin or KV call it makes. Package `raft` itself is
+allowed: its types name nodes, and importing them gives no access to another
+process's node.
+
+**The visualizer's controls refuse cross-site requests.** It binds to
+127.0.0.1 by default, but a page open in the same browser could still send
+requests to it. Every control therefore requires a custom header, which a
+cross-origin request cannot carry without a CORS preflight this server never
+approves, and a foreign `Origin` is refused. This is not authentication; §6
+still promises none. It only stops a stray web page from killing your nodes.
+
+**The visualizer takes no locks.** One goroutine owns the aggregated picture
+and another runs controls one at a time. Watchers, SSE streams and HTTP
+handlers talk to them over channels. The synchronization list in §1 is
+unchanged.
+
+**Frontend behaviour is tested at the stream, not in a browser.** Every
+acceptance test reads the same SSE stream the page renders, and drives the same
+POST routes its buttons use. The rendering itself was checked by eye in Chrome,
+against real 3- and 5-node clusters. There is no automated browser test, and
+this says so rather than implying one.

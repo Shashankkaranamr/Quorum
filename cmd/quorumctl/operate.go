@@ -70,17 +70,8 @@ func operate(name string, args []string, stdout, stderr io.Writer) error {
 	case "status":
 		return status(ctx, sup, stdout)
 	case "heal":
-		for _, id := range sup.IDs() {
-			if _, ok := sup.PID(id); !ok {
-				continue
-			}
-			err := withAdmin(sup, id, func(a adminv1.AdminClient) error {
-				_, err := a.Heal(ctx, &adminv1.HealRequest{})
-				return err
-			})
-			if err != nil {
-				return fmt.Errorf("heal node %d: %w", id, err)
-			}
+		if err := sup.Heal(ctx); err != nil {
+			return err
 		}
 		fmt.Fprintf(stdout, "healed\n")
 		return nil
@@ -89,7 +80,7 @@ func operate(name string, args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		if err := partition(ctx, sup, a, b, *oneway); err != nil {
+		if err := sup.Partition(ctx, a, b, *oneway); err != nil {
 			return err
 		}
 		arrow := "<->"
@@ -127,23 +118,18 @@ func operate(name string, args []string, stdout, stderr io.Writer) error {
 		fmt.Fprintf(stdout, "node %d started (pid %d)\n", id, pid)
 		return nil
 	case "freeze":
-		err := withAdmin(sup, id, func(a adminv1.AdminClient) error {
-			_, err := a.Freeze(ctx, &adminv1.FreezeRequest{AutoThawAfterMs: uint32(freezeFor.Milliseconds())})
-			return err
-		})
-		if err != nil {
+		if err := sup.Freeze(ctx, id, *freezeFor); err != nil {
 			return err
 		}
 		fmt.Fprintf(stdout, "node %d frozen (cooperatively: its loop is parked, the process is alive)\n", id)
 		return nil
 	default: // thaw
-		return withAdmin(sup, id, func(a adminv1.AdminClient) error {
-			r, err := a.Thaw(ctx, &adminv1.ThawRequest{})
-			if err == nil {
-				fmt.Fprintf(stdout, "node %d thawed after %dms, %d ticks missed\n", id, r.GetFrozenForMs(), r.GetTicksMissed())
-			}
+		r, err := sup.Thaw(ctx, id)
+		if err != nil {
 			return err
-		})
+		}
+		fmt.Fprintf(stdout, "node %d thawed after %dms, %d ticks missed\n", id, r.GetFrozenForMs(), r.GetTicksMissed())
+		return nil
 	}
 }
 
@@ -210,33 +196,6 @@ func status(ctx context.Context, sup *supervisor.Supervisor, stdout io.Writer) e
 			st.GetSnapshotIndex(), st.GetFrozen(), strings.Join(blocked, ","))
 	}
 	return tw.Flush()
-}
-
-// partition cuts links between groups a and b. Both ends of every link are
-// told, so a partition holds even if one side has already opened a stream:
-// the sender stops sending and the receiver refuses what arrives. With oneway,
-// only a -> b is cut.
-func partition(ctx context.Context, sup *supervisor.Supervisor, a, b []raft.NodeID, oneway bool) error {
-	block := func(on raft.NodeID, peers []raft.NodeID, req *adminv1.BlockLinksRequest) error {
-		for _, p := range peers {
-			req.PeerIds = append(req.PeerIds, uint64(p))
-		}
-		return withAdmin(sup, on, func(adm adminv1.AdminClient) error {
-			_, err := adm.BlockLinks(ctx, req)
-			return err
-		})
-	}
-	for _, id := range a {
-		if err := block(id, b, &adminv1.BlockLinksRequest{OutboundOnly: oneway}); err != nil {
-			return fmt.Errorf("node %d: %w", id, err)
-		}
-	}
-	for _, id := range b {
-		if err := block(id, a, &adminv1.BlockLinksRequest{InboundOnly: oneway}); err != nil {
-			return fmt.Errorf("node %d: %w", id, err)
-		}
-	}
-	return nil
 }
 
 // parseGroups reads "1,2 | 3" in whatever pieces the shell delivered it:

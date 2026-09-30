@@ -98,8 +98,13 @@ type PeerView struct {
 	// fault injector" from "this link is just down", which matters when reading
 	// the visualizer but must never be visible to the consensus core.
 	BlockedByInjection bool `protobuf:"varint,6,opt,name=blocked_by_injection,json=blockedByInjection,proto3" json:"blocked_by_injection,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// The two directions of blocked_by_injection, separately: outbound is this
+	// node -> peer, inbound is peer -> this node. A one-way partition sets one
+	// and not the other, and the visualizer draws each directed link from them.
+	BlockedOutbound bool `protobuf:"varint,7,opt,name=blocked_outbound,json=blockedOutbound,proto3" json:"blocked_outbound,omitempty"`
+	BlockedInbound  bool `protobuf:"varint,8,opt,name=blocked_inbound,json=blockedInbound,proto3" json:"blocked_inbound,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *PeerView) Reset() {
@@ -170,6 +175,20 @@ func (x *PeerView) GetMsSinceLastContact() int64 {
 func (x *PeerView) GetBlockedByInjection() bool {
 	if x != nil {
 		return x.BlockedByInjection
+	}
+	return false
+}
+
+func (x *PeerView) GetBlockedOutbound() bool {
+	if x != nil {
+		return x.BlockedOutbound
+	}
+	return false
+}
+
+func (x *PeerView) GetBlockedInbound() bool {
+	if x != nil {
+		return x.BlockedInbound
 	}
 	return false
 }
@@ -1016,7 +1035,7 @@ var File_quorum_admin_v1_admin_proto protoreflect.FileDescriptor
 
 const file_quorum_admin_v1_admin_proto_rawDesc = "" +
 	"\n" +
-	"\x1bquorum/admin/v1/admin.proto\x12\x0fquorum.admin.v1\x1a\x19quorum/raft/v1/raft.proto\"\xe6\x01\n" +
+	"\x1bquorum/admin/v1/admin.proto\x12\x0fquorum.admin.v1\x1a\x19quorum/raft/v1/raft.proto\"\xba\x02\n" +
 	"\bPeerView\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\x04R\x06nodeId\x12\x1d\n" +
 	"\n" +
@@ -1025,7 +1044,9 @@ const file_quorum_admin_v1_admin_proto_rawDesc = "" +
 	"matchIndex\x12\x1c\n" +
 	"\treachable\x18\x04 \x01(\bR\treachable\x121\n" +
 	"\x15ms_since_last_contact\x18\x05 \x01(\x03R\x12msSinceLastContact\x120\n" +
-	"\x14blocked_by_injection\x18\x06 \x01(\bR\x12blockedByInjection\"\xb9\x01\n" +
+	"\x14blocked_by_injection\x18\x06 \x01(\bR\x12blockedByInjection\x12)\n" +
+	"\x10blocked_outbound\x18\a \x01(\bR\x0fblockedOutbound\x12'\n" +
+	"\x0fblocked_inbound\x18\b \x01(\bR\x0eblockedInbound\"\xb9\x01\n" +
 	"\fLogEntryView\x12\x14\n" +
 	"\x05index\x18\x01 \x01(\x04R\x05index\x12\x12\n" +
 	"\x04term\x18\x02 \x01(\x04R\x04term\x12-\n" +

@@ -24,7 +24,7 @@ PROTOC_GEN_GRPC_VERSION?= latest
 
 .DEFAULT_GOAL := help
 
-.PHONY: help tools proto proto-check build test race cover vet lint fmt fmt-check ci run up down clean
+.PHONY: help tools proto proto-check build test race cover vet lint fmt fmt-check ci run up down viz clean
 
 help: ## Show available targets
 	@printf 'Quorum %s\n\n' '$(VERSION)'
@@ -87,8 +87,11 @@ run: build ## Show the cluster plan and one node's configuration
 up: build ## Start every node in the config as a separate process
 	./$(BIN)/quorumctl up -config $(CONFIG)
 
-down: build ## Stop every node started by up
-	./$(BIN)/quorumctl down
+down: build ## Kill every node started by up
+	./$(BIN)/quorumctl down -config $(CONFIG)
+
+viz: build ## Start the cluster if needed and serve the live visualizer on :8080
+	./$(BIN)/quorum-viz -config $(CONFIG)
 
 clean: ## Remove build output, coverage data and runtime cluster state
 	rm -rf $(BIN) coverage.out data

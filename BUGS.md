@@ -592,6 +592,14 @@ found" stays visible.*
   correctness one. It leaked a file handle when it refused to start
   (2026-09-30, above). It never recovered a wrong state.
 
+- **A bug in the visualizer during phase 7.** None found beyond test-writing
+  slips: a response body read in one call, and a page label that overlapped
+  its links, which were fixed before they counted as findings. The visualizer's
+  acceptance tests passed on their first run against real processes. That is
+  weak evidence on its own. It counts for something because each check has a
+  negative control, or measures something with a hard bound: 500 ms to show a
+  write, the operating system's view of a PID.
+
 - **A linearizability or durability violation under real-process chaos in
   phase 6.** None. Twelve seeds of `TestChaosSeeded`, about 93,000 operations
   under kills, isolations, one-way cuts, freezes and leader isolations, were

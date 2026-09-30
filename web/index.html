@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Quorum Visualizer</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand">Quorum <span id="cluster" class="muted"></span></div>
+  <div class="summary">
+    <span>leader <b id="leader">—</b></span>
+    <span>term <b id="term">—</b></span>
+    <span id="conn" class="conn">connecting…</span>
+  </div>
+</header>
+
+<main>
+  <section class="topology" aria-label="Cluster topology">
+    <svg id="topo" viewBox="-80 0 560 340" role="img" aria-label="Nodes and the directed links between them"></svg>
+    <div class="legend">
+      <span><i class="sw leader"></i>leader</span>
+      <span><i class="sw follower"></i>follower</span>
+      <span><i class="sw candidate"></i>candidate</span>
+      <span><i class="sw down"></i>down / unreachable</span>
+      <span><i class="ln up"></i>link up</span>
+      <span><i class="ln cut"></i>link cut (injected)</span>
+    </div>
+  </section>
+
+  <section class="controls" aria-label="Fault injection">
+    <h2>Faults</h2>
+    <div class="partition">
+      <div class="groups" id="groups"></div>
+      <label class="check"><input type="checkbox" id="oneway"> one-way: A cannot reach B (B still reaches A)</label>
+      <div class="row">
+        <button id="cut">Cut A ⟷ B</button>
+        <button id="heal">Heal all</button>
+      </div>
+      <p class="note">Partitions are cut in each node's transport, below Raft and above TCP:
+        sockets really close, but this is not a kernel firewall rule.</p>
+    </div>
+    <h2>Writes</h2>
+    <form id="putform" class="row">
+      <input id="key" placeholder="key" value="greeting" aria-label="key">
+      <input id="value" placeholder="value" value="hello" aria-label="value">
+      <button type="submit">Put</button>
+    </form>
+    <label class="check"><input type="checkbox" id="load"> background writes (to watch entries replicate)</label>
+    <p id="toast" class="toast" role="status"></p>
+  </section>
+
+  <section class="nodes" id="nodes" aria-label="Nodes"></section>
+
+  <section class="timeline" aria-label="Timeline">
+    <h2>Timeline</h2>
+    <ol id="events"></ol>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

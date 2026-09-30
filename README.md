@@ -19,16 +19,17 @@ write it has already been told succeeded, even if the leader that accepted it
 later dies. This is the same underlying problem etcd solves for Kubernetes'
 cluster state.
 
-> **Status: phase 6 of 8 — a linearizable replicated key-value store you can
-> break on purpose.**
+> **Status: phase 7 of 8 — a linearizable replicated key-value store you can
+> break on purpose, and watch.**
 >
 > Real `quorum-node` processes serve GET and PUT over gRPC. `quorumctl` starts
 > them, kills them (a real TerminateProcess/SIGKILL), partitions them both ways
 > or one way, freezes and heals them. A real-process test suite shows:
 > acknowledged writes survive leader kills and rolling restarts; a minority
 > refuses writes and reconciles exactly after healing; randomized fault
-> schedules stay linearizable under Porcupine. Not built yet: the live
-> visualizer (phase 7). The design is in [DESIGN.md](DESIGN.md), the roadmap
+> schedules stay linearizable under Porcupine. `make viz` serves a live view
+> of the cluster at http://127.0.0.1:8080 whose buttons inflict the same real
+> faults. Phase 8, the final write-up, remains. The design is in [DESIGN.md](DESIGN.md), the roadmap
 > and acceptance criteria in [PLAN.md](PLAN.md), what is actually verified in
 > [PROGRESS.md](PROGRESS.md), and every bug testing found in [BUGS.md](BUGS.md).
 

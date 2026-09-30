@@ -46,7 +46,8 @@ $Targets = [ordered]@{
     'ci'          = 'Everything CI would run'
     'run'         = "Show the cluster plan and one node's configuration"
     'up'          = 'Start every node in the config as a separate process'
-    'down'        = 'Stop every node started by up'
+    'down'        = 'Kill every node started by up'
+    'viz'         = 'Start the cluster if needed and serve the live visualizer on :8080'
     'clean'       = 'Remove build output, coverage data and runtime cluster state'
 }
 
@@ -211,7 +212,12 @@ function Target-Up {
 
 function Target-Down {
     Target-Build
-    Invoke-Checked { & "./$Bin/quorumctl" down }
+    Invoke-Checked { & "./$Bin/quorumctl" down -config $Config }
+}
+
+function Target-Viz {
+    Target-Build
+    Invoke-Checked { & "./$Bin/quorum-viz" -config $Config }
 }
 
 function Target-Clean {
@@ -243,5 +249,6 @@ switch ($Target) {
     'run' { Target-Run }
     'up' { Target-Up }
     'down' { Target-Down }
+    'viz' { Target-Viz }
     'clean' { Target-Clean }
 }
