@@ -50,23 +50,26 @@ type durabilityAudit struct {
 	// What the wrapped storage has made durable, modelled independently of it.
 	term  raft.Term
 	vote  raft.NodeID
-	terms []raft.Term // terms[i] is the term of durable entry i+1
+	snap  raft.SnapshotMeta
+	terms []raft.Term // terms[i] is the term of durable entry snap.Index+i+1
 
 	pendingEntries []raft.Entry
 	pendingHS      *raft.HardState
 	syncing        bool
 
 	sends      int
+	snapshots  int
 	violations []string
 }
 
 func newAudit(id raft.NodeID, s storage.Storage) (*durabilityAudit, error) {
-	hs, ents, _, err := s.InitialState()
+	rec, err := s.InitialState()
 	if err != nil {
 		return nil, err
 	}
-	a := &durabilityAudit{id: id, term: hs.Term, vote: hs.VotedFor}
-	for _, e := range ents {
+	a := &durabilityAudit{id: id, term: rec.HardState.Term, vote: rec.HardState.VotedFor,
+		snap: rec.Snapshot.Meta}
+	for _, e := range rec.Entries {
 		a.terms = append(a.terms, e.Term)
 	}
 	return a, nil
@@ -77,16 +80,17 @@ func (a *durabilityAudit) violate(m raft.Message, format string, args ...any) {
 		fmt.Sprintf("node %d sent %s: %s", a.id, m, fmt.Sprintf(format, args...)))
 }
 
-func (a *durabilityAudit) durableLast() raft.Index { return raft.Index(len(a.terms)) }
+func (a *durabilityAudit) durableLast() raft.Index { return a.snap.Index + raft.Index(len(a.terms)) }
 
 func (a *durabilityAudit) durableTermAt(i raft.Index) (raft.Term, bool) {
-	if i == 0 {
-		return 0, true
-	}
-	if i > a.durableLast() {
+	switch {
+	case i == a.snap.Index:
+		return a.snap.Term, true
+	case i < a.snap.Index || i > a.durableLast():
 		return 0, false
+	default:
+		return a.terms[i-a.snap.Index-1], true
 	}
-	return a.terms[i-1], true
 }
 
 // checkSend is the verdict on one outbound message.
@@ -128,6 +132,11 @@ func (a *durabilityAudit) checkSend(m raft.Message) {
 				break
 			}
 		}
+	case raft.MsgInstallSnapshot:
+		if m.SnapshotMeta.Index > a.snap.Index {
+			a.violate(m, "sending snapshot %d@%d when only snapshot %d is durable locally",
+				m.SnapshotMeta.Index, m.SnapshotMeta.Term, a.snap.Index)
+		}
 	}
 }
 
@@ -165,7 +174,8 @@ func (s *auditedStorage) Sync() error {
 	}
 	// Only now, with Sync returned, does the model treat the batch as durable.
 	for _, e := range a.pendingEntries {
-		a.terms = append(a.terms[:e.Index-1], e.Term)
+		pos := e.Index - a.snap.Index - 1
+		a.terms = append(a.terms[:pos], e.Term)
 	}
 	if hs := a.pendingHS; hs != nil {
 		a.term, a.vote = hs.Term, hs.VotedFor
@@ -174,7 +184,24 @@ func (s *auditedStorage) Sync() error {
 	return nil
 }
 
-func (s *auditedStorage) InitialState() (raft.HardState, []raft.Entry, raft.Index, error) {
+// SaveSnapshot is durable when it returns, so the model folds its log at once,
+// by the same keep-the-suffix-if-it-matches rule storage applies.
+func (s *auditedStorage) SaveSnapshot(snap raft.Snapshot) error {
+	if err := s.inner.SaveSnapshot(snap); err != nil {
+		return err
+	}
+	a, m := s.audit, snap.Meta
+	a.snapshots++
+	if t, ok := a.durableTermAt(m.Index); ok && t == m.Term && m.Index >= a.snap.Index {
+		a.terms = append([]raft.Term(nil), a.terms[m.Index-a.snap.Index:]...)
+	} else {
+		a.terms = nil
+	}
+	a.snap = m
+	return nil
+}
+
+func (s *auditedStorage) InitialState() (storage.Recovered, error) {
 	return s.inner.InitialState()
 }
 
@@ -307,24 +334,34 @@ func newTestCluster(t *testing.T, opts testutil.Options) *testutil.Cluster {
 // few seeds so that the ordering is also checked against the storage that
 // actually ships.
 func TestNoSendBeforeSync(t *testing.T) {
+	// The snapshot variants compact every few entries, so the audit also sees
+	// snapshots saved between Readies, snapshots installed from a leader, and
+	// the acknowledgements a follower sends for them.
 	type variant struct {
 		name  string
 		seeds int
 		disk  bool
+		snap  bool
 	}
-	variants := []variant{{"mem", 40, false}, {"wal", 3, true}}
+	variants := []variant{
+		{"mem", 40, false, false}, {"wal", 3, true, false},
+		{"mem+snapshots", 40, false, true}, {"wal+snapshots", 3, true, true},
+	}
 	if testing.Short() {
-		variants = []variant{{"mem", 8, false}, {"wal", 1, true}}
+		variants = []variant{{"mem", 8, false, false}, {"wal", 1, true, false}, {"mem+snapshots", 8, false, true}}
 	}
 
 	for _, v := range variants {
 		for _, n := range []int{3, 5} {
 			t.Run(fmt.Sprintf("%s/n=%d", v.name, n), func(t *testing.T) {
-				totalSends := 0
+				totalSends, totalSnaps := 0, 0
 				for seed := range uint64(v.seeds) {
 					opts := faultyOptions(n, seed)
 					if v.disk {
 						opts.Storage = testutil.WALStorageFactory(t.TempDir(), storage.WALOptions{})
+					}
+					if v.snap {
+						opts.SnapshotThreshold = 10
 					}
 					audits := withAudit(&opts)
 					c := newTestCluster(t, opts)
@@ -334,11 +371,15 @@ func TestNoSendBeforeSync(t *testing.T) {
 					for _, a := range *audits {
 						require.NoErrorf(t, a.err(), "seed %d", seed)
 						totalSends += a.sends
+						totalSnaps += a.snapshots
 					}
 					require.NotZero(t, c.Checker.MaxCommitted, "seed %d committed nothing", seed)
 				}
-				t.Logf("%d messages audited", totalSends)
+				t.Logf("%d messages audited, %d snapshots saved", totalSends, totalSnaps)
 				require.NotZero(t, totalSends)
+				if v.snap {
+					require.NotZero(t, totalSnaps, "the snapshot variant saved no snapshots")
+				}
 			})
 		}
 	}
@@ -439,6 +480,53 @@ func TestDurabilityAuditCatchesMisorderedDrivers(t *testing.T) {
 // has nothing to make durable, and fsyncing an unchanged file for it would add
 // latency to every heartbeat for no durability at all. That refinement is
 // recorded in DESIGN.md §10.
+// TestDurabilityAuditCatchesAnEarlySnapshotAck is the negative control for the
+// snapshot half of TestNoSendBeforeSync. A follower that completes a snapshot
+// transfer acknowledges it with "I hold everything up to its index"; sending
+// that before the snapshot is durable is the same broken promise as
+// acknowledging entries that are not. The audit must catch it, and must not
+// flag the correct order.
+func TestDurabilityAuditCatchesAnEarlySnapshotAck(t *testing.T) {
+	for _, early := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ack before snapshot is durable=%v", early), func(t *testing.T) {
+			node := newVoter(t, 2, storage.NewMem())
+			mem := storage.NewMem()
+			a, err := newAudit(2, mem)
+			require.NoError(t, err)
+			s := &auditedStorage{inner: mem, audit: a}
+			tr := auditedTransport{inner: transport.Discard, audit: a}
+
+			require.NoError(t, node.Step(raft.Message{
+				Type: raft.MsgInstallSnapshot, From: 1, To: 2, Term: 1,
+				SnapshotMeta: raft.SnapshotMeta{Index: 9, Term: 1}, SnapshotData: []byte("image"), SnapshotDone: true,
+			}))
+			rd := node.Ready()
+			require.NotNil(t, rd.Snapshot)
+
+			if !early {
+				require.NoError(t, s.SaveSnapshot(*rd.Snapshot))
+			}
+			require.NoError(t, s.Append(rd.Entries))
+			if rd.HardState != nil {
+				require.NoError(t, s.SetHardState(*rd.HardState))
+			}
+			require.NoError(t, s.Sync())
+			tr.Send(rd.Messages)
+			if early {
+				require.NoError(t, s.SaveSnapshot(*rd.Snapshot))
+			}
+			node.Advance()
+
+			if early {
+				require.Error(t, a.err(), "the audit missed an acknowledgement sent before its snapshot was durable")
+				t.Logf("caught: %v", a.err())
+			} else {
+				require.NoError(t, a.err())
+			}
+		})
+	}
+}
+
 func TestOneFsyncPerReady(t *testing.T) {
 	type fsyncs struct{ durable, empty, maxBatch int }
 	counts := map[raft.NodeID]*fsyncs{}
@@ -541,7 +629,7 @@ func (w *countingWAL) Sync() error {
 
 func newVoter(t *testing.T, id raft.NodeID, s storage.Storage) *raft.Node {
 	t.Helper()
-	hs, ents, applied, err := s.InitialState()
+	rec, err := s.InitialState()
 	require.NoError(t, err)
 	n, err := raft.New(raft.Config{
 		ID:                      id,
@@ -551,9 +639,9 @@ func newVoter(t *testing.T, id raft.NodeID, s storage.Storage) *raft.Node {
 		HeartbeatTimeoutTicks:   3,
 		MaxEntriesPerAppend:     64,
 		Rand:                    func(int) int { return 0 },
-		HardState:               hs,
-		Entries:                 ents,
-		Applied:                 applied,
+		HardState:               rec.HardState,
+		Snapshot:                rec.Snapshot,
+		Entries:                 rec.Entries,
 	})
 	require.NoError(t, err)
 	return n
@@ -578,9 +666,10 @@ func (f failingSync) Sync() error {
 // node would look like if it kept its vote only in memory.
 type forgetsHardState struct{ storage.Storage }
 
-func (f forgetsHardState) InitialState() (raft.HardState, []raft.Entry, raft.Index, error) {
-	_, ents, applied, err := f.Storage.InitialState()
-	return raft.HardState{}, ents, applied, err
+func (f forgetsHardState) InitialState() (storage.Recovered, error) {
+	rec, err := f.Storage.InitialState()
+	rec.HardState = raft.HardState{}
+	return rec, err
 }
 
 // voteAcrossRestart has node 2 receive a vote request from candidate 1 in term

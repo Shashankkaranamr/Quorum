@@ -140,6 +140,23 @@ func HardStateFromProto(p *raftv1.HardState) raft.HardState {
 	}
 }
 
+// SnapshotMetaToProto converts the position a snapshot replaces.
+func SnapshotMetaToProto(m raft.SnapshotMeta) *raftv1.SnapshotMetadata {
+	return &raftv1.SnapshotMetadata{
+		LastIncludedIndex: uint64(m.Index),
+		LastIncludedTerm:  uint64(m.Term),
+	}
+}
+
+// SnapshotMetaFromProto converts it back. A missing message is the zero
+// position, which no real snapshot has.
+func SnapshotMetaFromProto(p *raftv1.SnapshotMetadata) raft.SnapshotMeta {
+	return raft.SnapshotMeta{
+		Index: raft.Index(p.GetLastIncludedIndex()),
+		Term:  raft.Term(p.GetLastIncludedTerm()),
+	}
+}
+
 // MessageToProto converts a Raft message to its wire form.
 //
 // The core uses a flat struct with a type tag; the wire uses a oneof. The
@@ -187,8 +204,21 @@ func MessageToProto(m raft.Message) (*raftv1.Message, error) {
 			},
 		}
 
-	case raft.MsgInstallSnapshot, raft.MsgInstallSnapshotResp:
-		return nil, fmt.Errorf("pbconv: %s is not implemented until phase 4", m.Type)
+	case raft.MsgInstallSnapshot:
+		out.Body = &raftv1.Message_InstallSnapshot{InstallSnapshot: &raftv1.InstallSnapshot{
+			Metadata: SnapshotMetaToProto(m.SnapshotMeta),
+			Offset:   m.SnapshotOffset,
+			Data:     m.SnapshotData,
+			Done:     m.SnapshotDone,
+		}}
+
+	case raft.MsgInstallSnapshotResp:
+		out.Body = &raftv1.Message_InstallSnapshotResponse{
+			InstallSnapshotResponse: &raftv1.InstallSnapshotResponse{
+				BytesReceived: m.SnapshotBytesReceived,
+				Metadata:      SnapshotMetaToProto(m.SnapshotMeta),
+			},
+		}
 
 	default:
 		return nil, fmt.Errorf("pbconv: unknown message type %s", m.Type)
@@ -236,8 +266,17 @@ func MessageFromProto(p *raftv1.Message) (raft.Message, error) {
 		m.ConflictTerm = raft.Term(b.AppendEntriesResponse.GetConflictTerm())
 		m.ConflictIndex = raft.Index(b.AppendEntriesResponse.GetConflictIndex())
 
-	case *raftv1.Message_InstallSnapshot, *raftv1.Message_InstallSnapshotResponse:
-		return raft.Message{}, fmt.Errorf("pbconv: InstallSnapshot is not implemented until phase 4")
+	case *raftv1.Message_InstallSnapshot:
+		m.Type = raft.MsgInstallSnapshot
+		m.SnapshotMeta = SnapshotMetaFromProto(b.InstallSnapshot.GetMetadata())
+		m.SnapshotOffset = b.InstallSnapshot.GetOffset()
+		m.SnapshotData = b.InstallSnapshot.GetData()
+		m.SnapshotDone = b.InstallSnapshot.GetDone()
+
+	case *raftv1.Message_InstallSnapshotResponse:
+		m.Type = raft.MsgInstallSnapshotResp
+		m.SnapshotBytesReceived = b.InstallSnapshotResponse.GetBytesReceived()
+		m.SnapshotMeta = SnapshotMetaFromProto(b.InstallSnapshotResponse.GetMetadata())
 
 	default:
 		return raft.Message{}, fmt.Errorf("pbconv: message from %d carries no recognized body",

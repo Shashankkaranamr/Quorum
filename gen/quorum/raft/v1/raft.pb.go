@@ -816,11 +816,19 @@ func (x *InstallSnapshot) GetDone() bool {
 	return false
 }
 
+// InstallSnapshotResponse acknowledges a chunk that did not complete the
+// transfer. The final chunk is acknowledged with an AppendEntriesResponse
+// instead: once the snapshot is installed the follower's log agrees with the
+// leader's up to its last included index, and ordinary replication resumes.
 type InstallSnapshotResponse struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	// bytes_received lets the leader resume a transfer interrupted mid-stream
 	// rather than restarting it.
 	BytesReceived uint64 `protobuf:"varint,1,opt,name=bytes_received,json=bytesReceived,proto3" json:"bytes_received,omitempty"`
+	// metadata names the snapshot bytes_received refers to. Without it, an
+	// acknowledgement delayed past the leader's next compaction would be read
+	// as progress on the newer snapshot.
+	Metadata      *SnapshotMetadata `protobuf:"bytes,2,opt,name=metadata,proto3" json:"metadata,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -860,6 +868,13 @@ func (x *InstallSnapshotResponse) GetBytesReceived() uint64 {
 		return x.BytesReceived
 	}
 	return 0
+}
+
+func (x *InstallSnapshotResponse) GetMetadata() *SnapshotMetadata {
+	if x != nil {
+		return x.Metadata
+	}
+	return nil
 }
 
 // WalEntryBatch is everything one Ready batch makes durable: its entries and,
@@ -929,12 +944,26 @@ func (x *WalEntryBatch) GetHardState() *HardState {
 // names has itself been written and fsynced. That ordering is what makes a
 // crash mid-snapshot recoverable: a pointer always names a complete file, and
 // a complete file with no pointer is simply ignored and overwritten later.
+//
+// A pointer is always the FIRST record of a fresh segment, and it carries
+// everything the node still needs from before it: the log entries after the
+// snapshot and the current hard state. Recovery therefore starts at the last
+// segment that begins with a pointer and never needs to read anything older,
+// so the older segments can be deleted in any order -- and a crash part-way
+// through deleting them leaves nothing recovery has to make sense of. As with
+// WalEntryBatch, putting it all in one record under one CRC means a torn write
+// loses the pointer whole or not at all.
 type WalSnapshotPointer struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Metadata      *SnapshotMetadata      `protobuf:"bytes,1,opt,name=metadata,proto3" json:"metadata,omitempty"`
-	Filename      string                 `protobuf:"bytes,2,opt,name=filename,proto3" json:"filename,omitempty"`
-	Crc32C        uint32                 `protobuf:"varint,3,opt,name=crc32c,proto3" json:"crc32c,omitempty"`
-	SizeBytes     uint64                 `protobuf:"varint,4,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Metadata  *SnapshotMetadata      `protobuf:"bytes,1,opt,name=metadata,proto3" json:"metadata,omitempty"`
+	Filename  string                 `protobuf:"bytes,2,opt,name=filename,proto3" json:"filename,omitempty"`
+	Crc32C    uint32                 `protobuf:"varint,3,opt,name=crc32c,proto3" json:"crc32c,omitempty"`
+	SizeBytes uint64                 `protobuf:"varint,4,opt,name=size_bytes,json=sizeBytes,proto3" json:"size_bytes,omitempty"`
+	// The hard state as of the snapshot. Absent only if none was ever written.
+	HardState *HardState `protobuf:"bytes,5,opt,name=hard_state,json=hardState,proto3" json:"hard_state,omitempty"`
+	// The log entries after metadata.last_included_index that the node still
+	// holds, in order.
+	Entries       []*Entry `protobuf:"bytes,6,rep,name=entries,proto3" json:"entries,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -995,6 +1024,20 @@ func (x *WalSnapshotPointer) GetSizeBytes() uint64 {
 		return x.SizeBytes
 	}
 	return 0
+}
+
+func (x *WalSnapshotPointer) GetHardState() *HardState {
+	if x != nil {
+		return x.HardState
+	}
+	return nil
+}
+
+func (x *WalSnapshotPointer) GetEntries() []*Entry {
+	if x != nil {
+		return x.Entries
+	}
+	return nil
 }
 
 // StreamSummary is returned when a stream closes. It exists for observability;
@@ -1094,19 +1137,23 @@ const file_quorum_raft_v1_raft_proto_rawDesc = "" +
 	"\bmetadata\x18\x01 \x01(\v2 .quorum.raft.v1.SnapshotMetadataR\bmetadata\x12\x16\n" +
 	"\x06offset\x18\x02 \x01(\x04R\x06offset\x12\x12\n" +
 	"\x04data\x18\x03 \x01(\fR\x04data\x12\x12\n" +
-	"\x04done\x18\x04 \x01(\bR\x04done\"@\n" +
+	"\x04done\x18\x04 \x01(\bR\x04done\"~\n" +
 	"\x17InstallSnapshotResponse\x12%\n" +
-	"\x0ebytes_received\x18\x01 \x01(\x04R\rbytesReceived\"z\n" +
+	"\x0ebytes_received\x18\x01 \x01(\x04R\rbytesReceived\x12<\n" +
+	"\bmetadata\x18\x02 \x01(\v2 .quorum.raft.v1.SnapshotMetadataR\bmetadata\"z\n" +
 	"\rWalEntryBatch\x12/\n" +
 	"\aentries\x18\x01 \x03(\v2\x15.quorum.raft.v1.EntryR\aentries\x128\n" +
 	"\n" +
-	"hard_state\x18\x02 \x01(\v2\x19.quorum.raft.v1.HardStateR\thardState\"\xa5\x01\n" +
+	"hard_state\x18\x02 \x01(\v2\x19.quorum.raft.v1.HardStateR\thardState\"\x90\x02\n" +
 	"\x12WalSnapshotPointer\x12<\n" +
 	"\bmetadata\x18\x01 \x01(\v2 .quorum.raft.v1.SnapshotMetadataR\bmetadata\x12\x1a\n" +
 	"\bfilename\x18\x02 \x01(\tR\bfilename\x12\x16\n" +
 	"\x06crc32c\x18\x03 \x01(\rR\x06crc32c\x12\x1d\n" +
 	"\n" +
-	"size_bytes\x18\x04 \x01(\x04R\tsizeBytes\"<\n" +
+	"size_bytes\x18\x04 \x01(\x04R\tsizeBytes\x128\n" +
+	"\n" +
+	"hard_state\x18\x05 \x01(\v2\x19.quorum.raft.v1.HardStateR\thardState\x12/\n" +
+	"\aentries\x18\x06 \x03(\v2\x15.quorum.raft.v1.EntryR\aentries\"<\n" +
 	"\rStreamSummary\x12+\n" +
 	"\x11messages_received\x18\x01 \x01(\x04R\x10messagesReceived*\x82\x01\n" +
 	"\tEntryType\x12\x1a\n" +
@@ -1158,16 +1205,19 @@ var file_quorum_raft_v1_raft_proto_depIdxs = []int32{
 	10, // 6: quorum.raft.v1.Message.install_snapshot_response:type_name -> quorum.raft.v1.InstallSnapshotResponse
 	1,  // 7: quorum.raft.v1.AppendEntries.entries:type_name -> quorum.raft.v1.Entry
 	3,  // 8: quorum.raft.v1.InstallSnapshot.metadata:type_name -> quorum.raft.v1.SnapshotMetadata
-	1,  // 9: quorum.raft.v1.WalEntryBatch.entries:type_name -> quorum.raft.v1.Entry
-	2,  // 10: quorum.raft.v1.WalEntryBatch.hard_state:type_name -> quorum.raft.v1.HardState
-	3,  // 11: quorum.raft.v1.WalSnapshotPointer.metadata:type_name -> quorum.raft.v1.SnapshotMetadata
-	4,  // 12: quorum.raft.v1.RaftTransport.Stream:input_type -> quorum.raft.v1.Message
-	13, // 13: quorum.raft.v1.RaftTransport.Stream:output_type -> quorum.raft.v1.StreamSummary
-	13, // [13:14] is the sub-list for method output_type
-	12, // [12:13] is the sub-list for method input_type
-	12, // [12:12] is the sub-list for extension type_name
-	12, // [12:12] is the sub-list for extension extendee
-	0,  // [0:12] is the sub-list for field type_name
+	3,  // 9: quorum.raft.v1.InstallSnapshotResponse.metadata:type_name -> quorum.raft.v1.SnapshotMetadata
+	1,  // 10: quorum.raft.v1.WalEntryBatch.entries:type_name -> quorum.raft.v1.Entry
+	2,  // 11: quorum.raft.v1.WalEntryBatch.hard_state:type_name -> quorum.raft.v1.HardState
+	3,  // 12: quorum.raft.v1.WalSnapshotPointer.metadata:type_name -> quorum.raft.v1.SnapshotMetadata
+	2,  // 13: quorum.raft.v1.WalSnapshotPointer.hard_state:type_name -> quorum.raft.v1.HardState
+	1,  // 14: quorum.raft.v1.WalSnapshotPointer.entries:type_name -> quorum.raft.v1.Entry
+	4,  // 15: quorum.raft.v1.RaftTransport.Stream:input_type -> quorum.raft.v1.Message
+	13, // 16: quorum.raft.v1.RaftTransport.Stream:output_type -> quorum.raft.v1.StreamSummary
+	16, // [16:17] is the sub-list for method output_type
+	15, // [15:16] is the sub-list for method input_type
+	15, // [15:15] is the sub-list for extension type_name
+	15, // [15:15] is the sub-list for extension extendee
+	0,  // [0:15] is the sub-list for field type_name
 }
 
 func init() { file_quorum_raft_v1_raft_proto_init() }

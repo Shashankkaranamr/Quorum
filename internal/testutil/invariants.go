@@ -45,8 +45,19 @@ const (
 
 	// WellFormed catches internal contradictions that mean a bug regardless of
 	// the safety properties: applied past committed, committed past the end of
-	// the log.
+	// the log, compacted past what was applied.
 	WellFormed Invariant = "WellFormed"
+
+	// SnapshotFidelity holds when every replica's state machine is identical
+	// at every applied index, whether it got there by applying entries or by
+	// restoring a snapshot.
+	//
+	// For replicas that applied the log it follows from State Machine Safety.
+	// Its purpose is the other case: a replica rebuilt from a snapshot never
+	// applied the entries the snapshot covers, so State Machine Safety cannot
+	// see them. Comparing the state itself is the only way to tell that a
+	// snapshot captured, carried and restored exactly what the log produced.
+	SnapshotFidelity Invariant = "SnapshotFidelity"
 )
 
 // Violation is a single invariant failure, with enough context to reproduce it.
@@ -75,6 +86,12 @@ type appliedRecord struct {
 	by    raft.NodeID
 }
 
+type hashRecord struct {
+	sum [32]byte
+	by  raft.NodeID
+	how string
+}
+
 // Checker accumulates the history of a run and verifies Raft's safety
 // properties against it.
 //
@@ -98,6 +115,10 @@ type Checker struct {
 	// at each index, and applied is what has actually reached a state machine.
 	committed map[raft.Index]committedRecord
 	applied   map[raft.Index]appliedRecord
+
+	// stateHash is the state-machine hash first observed at each applied
+	// index. SnapshotFidelity compares every later observation against it.
+	stateHash map[raft.Index]hashRecord
 
 	// leadersSeen records which (node, term) pairs have already had their
 	// Leader Completeness check run, so it runs once per election rather than
@@ -149,6 +170,7 @@ func NewChecker() *Checker {
 		leaderLog:      make(map[raft.NodeID]leaderLogSnapshot),
 		committed:      make(map[raft.Index]committedRecord),
 		applied:        make(map[raft.Index]appliedRecord),
+		stateHash:      make(map[raft.Index]hashRecord),
 		leadersChecked: make(map[leaderTerm]bool),
 		prevRev:        make(map[raft.NodeID]logRevision),
 		committedSeen:  make(map[raft.NodeID]raft.Index),
@@ -241,6 +263,14 @@ func (c *Checker) checkWellFormed(tick uint64, id raft.NodeID, v NodeView) {
 		c.fail(tick, WellFormed, "node %d committed %d past last log index %d",
 			id, s.CommitIndex, s.LastLogIndex)
 	}
+	if s.SnapshotIndex > s.LastApplied {
+		c.fail(tick, WellFormed, "node %d compacted to %d but has only applied %d",
+			id, s.SnapshotIndex, s.LastApplied)
+	}
+	if n := len(v.Log); n > 0 && v.Log[0].Index != s.SnapshotIndex+1 {
+		c.fail(tick, WellFormed, "node %d log starts at %d but its snapshot ends at %d",
+			id, v.Log[0].Index, s.SnapshotIndex)
+	}
 }
 
 func (c *Checker) checkElectionSafety(tick uint64, id raft.NodeID, v NodeView) {
@@ -270,21 +300,28 @@ func (c *Checker) checkLeaderAppendOnly(tick uint64, id raft.NodeID, v NodeView)
 		return
 	}
 	if had && prev.term == v.Status.Term {
-		// Still leader in the same term: the old log must be a prefix of the
-		// new one. Anything else means the leader overwrote or deleted its own
-		// entries.
-		if len(prev.log) > len(v.Log) {
-			c.fail(tick, LeaderAppendOnly,
-				"leader %d (term %d) log shrank from %d to %d entries",
-				id, v.Status.Term, len(prev.log), len(v.Log))
-		} else {
-			for i, e := range prev.log {
-				if v.Log[i].Index != e.Index || v.Log[i].Term != e.Term {
-					c.fail(tick, LeaderAppendOnly,
-						"leader %d (term %d) rewrote its own entry at position %d: was %s, now %s",
-						id, v.Status.Term, i, e, v.Log[i])
-					break
-				}
+		// Still leader in the same term: every entry it held must still be
+		// there, unchanged, except those it has since folded into a snapshot.
+		// Compaction drops only applied entries, which is not the kind of
+		// deletion the property forbids. Anything else means the leader
+		// overwrote or deleted its own entries.
+		first := v.Status.SnapshotIndex + 1
+		for _, e := range prev.log {
+			if e.Index < first {
+				continue
+			}
+			pos := int(e.Index - first)
+			if pos >= len(v.Log) {
+				c.fail(tick, LeaderAppendOnly,
+					"leader %d (term %d) log shrank: it held entry %s, and now ends at %d",
+					id, v.Status.Term, e, v.Status.LastLogIndex)
+				break
+			}
+			if v.Log[pos].Term != e.Term {
+				c.fail(tick, LeaderAppendOnly,
+					"leader %d (term %d) rewrote its own entry at index %d: was %s, now %s",
+					id, v.Status.Term, e.Index, e, v.Log[pos])
+				break
 			}
 		}
 	}
@@ -337,7 +374,20 @@ func (c *Checker) checkLogMatching(tick uint64, views map[raft.NodeID]NodeView, 
 	}
 }
 
+// compareLogs checks one pair. The logs may start at different indices, since
+// each node compacts on its own schedule, so they are compared over the range
+// both still hold. Below that range at least one of them has folded the
+// entries into a snapshot, which only ever covers committed entries, and those
+// are checked by CommittedEntriesAreStable and SnapshotFidelity instead.
 func (c *Checker) compareLogs(tick uint64, a raft.NodeID, la []raft.Entry, b raft.NodeID, lb []raft.Entry) {
+	if len(la) == 0 || len(lb) == 0 {
+		return
+	}
+	start := max(la[0].Index, lb[0].Index)
+	if start > la[len(la)-1].Index || start > lb[len(lb)-1].Index {
+		return
+	}
+	la, lb = la[start-la[0].Index:], lb[start-lb[0].Index:]
 	n := min(len(la), len(lb))
 
 	common := 0
@@ -349,8 +399,8 @@ func (c *Checker) compareLogs(tick uint64, a raft.NodeID, la []raft.Entry, b raf
 		if la[i].Index == lb[i].Index && la[i].Term == lb[i].Term {
 			c.fail(tick, LogMatching,
 				"nodes %d and %d agree at index %d term %d but diverge earlier "+
-					"(first difference at position %d: %s vs %s)",
-				a, b, la[i].Index, la[i].Term, common, la[common], lb[common])
+					"(first difference at index %d: %s vs %s)",
+				a, b, la[i].Index, la[i].Term, la[common].Index, la[common], lb[common])
 			return
 		}
 	}
@@ -403,6 +453,18 @@ func (c *Checker) checkLeaderCompleteness(tick uint64, id raft.NodeID, v NodeVie
 			// property only constrains leaders of strictly higher terms.
 			continue
 		}
+		if s := v.Status; idx <= s.SnapshotIndex {
+			// Folded into the leader's snapshot. The boundary entry's term is
+			// still known and must match; below it, the snapshot's content is
+			// what SnapshotFidelity checks.
+			if idx == s.SnapshotIndex && s.SnapshotTerm != rec.entry.Term {
+				c.fail(tick, LeaderCompleteness,
+					"node %d became leader in term %d with a snapshot ending at %d@%d, "+
+						"but term %d was committed there in term %d",
+					id, s.Term, idx, s.SnapshotTerm, rec.entry.Term, rec.term)
+			}
+			continue
+		}
 		got, ok := byIndex[idx]
 		if !ok {
 			c.fail(tick, LeaderCompleteness,
@@ -437,6 +499,24 @@ func (c *Checker) RecordApply(tick uint64, id raft.NodeID, e raft.Entry) {
 			id, e, e.Index, prev.by, prev.entry)
 	}
 }
+
+// RecordStateHash notes the state a node's state machine is in at index i, and
+// fires if any other node was ever in a different state at the same index.
+func (c *Checker) RecordStateHash(tick uint64, id raft.NodeID, i raft.Index, sum [32]byte, how string) {
+	prev, seen := c.stateHash[i]
+	if !seen {
+		c.stateHash[i] = hashRecord{sum: sum, by: id, how: how}
+		return
+	}
+	if prev.sum != sum {
+		c.fail(tick, SnapshotFidelity,
+			"node %d reached state %x at index %d by %s, but node %d reached %x there by %s",
+			id, sum[:], i, how, prev.by, prev.sum[:], prev.how)
+	}
+}
+
+// StateHashes is how many distinct indices have had a state recorded.
+func (c *Checker) StateHashes() int { return len(c.stateHash) }
 
 // AppliedEntry returns the entry applied at an index, if any.
 func (c *Checker) AppliedEntry(i raft.Index) (raft.Entry, bool) {

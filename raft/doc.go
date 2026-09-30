@@ -14,6 +14,7 @@
 //	Propose([]byte)            append a command (leader only)
 //	Ready() Ready              what must now be persisted, sent, and applied
 //	Advance()                  acknowledge that a Ready was fully processed
+//	Compact(Index, []byte)     fold the applied log into a snapshot
 //
 // Because the core neither blocks nor performs I/O, its caller decides the
 // ordering of durability and transmission. That ordering is a correctness
@@ -31,5 +32,7 @@
 // that the protobuf runtime is not a dependency of the consensus core. That is
 // what keeps the no-I/O claim mechanically checkable; see purity_test.go.
 //
-// Phase 2 fills this package in. It is currently a documented stub.
+// Phase 2 built elections and replication; phase 4 added log compaction and
+// InstallSnapshot. The core keeps its latest snapshot's bytes in memory so it
+// can send them, but never interprets them.
 package raft

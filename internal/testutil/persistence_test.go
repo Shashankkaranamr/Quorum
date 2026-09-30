@@ -158,13 +158,14 @@ func TestClusterRestartRecoversCommitted(t *testing.T) {
 // layer that acknowledged a write before it was really durable.
 type losesLastCommitted struct{ *storage.WAL }
 
-func (l losesLastCommitted) InitialState() (raft.HardState, []raft.Entry, raft.Index, error) {
-	hs, ents, applied, err := l.WAL.InitialState()
-	if err != nil || hs.Commit == 0 {
-		return hs, ents, applied, err
+func (l losesLastCommitted) InitialState() (storage.Recovered, error) {
+	rec, err := l.WAL.InitialState()
+	if err != nil || rec.HardState.Commit <= rec.Snapshot.Meta.Index {
+		return rec, err
 	}
-	hs.Commit--
-	return hs, ents[:hs.Commit], applied, nil
+	rec.HardState.Commit--
+	rec.Entries = rec.Entries[:rec.HardState.Commit-rec.Snapshot.Meta.Index]
+	return rec, nil
 }
 
 // TestRestartCheckCatchesLostCommittedEntries is the negative control for

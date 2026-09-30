@@ -18,6 +18,13 @@
 // session expiry can in principle break exactly-once delivery for a client that
 // has been idle past the garbage-collection window.
 //
-// Phase 5 fills this package in; phase 4 adds snapshot and restore. It is
-// currently a documented stub.
+// Snapshot renders the data and the session table together, sorted, so two
+// replicas in the same state produce byte-identical snapshots and can be
+// compared by hash. Restore replaces both.
+//
+// Phase 4 built the store, the session table and snapshotting, because
+// "deduplication survives a snapshot" cannot be tested against anything less.
+// Phase 5 serves it over gRPC. Session expiry is not implemented yet: a
+// session is never garbage-collected, so STATUS_SESSION_EXPIRED is returned
+// only for a client id that was never registered.
 package statemachine

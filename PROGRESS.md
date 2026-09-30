@@ -13,20 +13,23 @@ updated at the end of every phase.
 
 | | |
 |---|---|
-| **Current phase** | **3 of 8 — complete** |
-| **Next phase** | 4 — snapshotting and log compaction |
-| **Last updated** | 2026-09-27 |
+| **Current phase** | **4 of 8 — complete** |
+| **Next phase** | 5 — gRPC KV service, linearizable reads, deduplication |
+| **Last updated** | 2026-09-30 |
 | **Branch** | `main` at `github.com/Shashankkaranamr/Quorum` |
-| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~98s end to end) |
-| **Tests** | 72 test and fuzz functions across 7 packages, all passing |
+| **Build state** | `make ci` green: fmt-check, lint (0 issues), build, test, race (~150s end to end, cold cache) |
+| **Tests** | 100 test and fuzz functions across 8 packages, all passing |
 | **Go** | 1.27.0 |
 
-> **Raft elects, replicates and survives restarts.** Each node can now persist
-> to a real write-ahead log that recovers cleanly from a crash at any byte, and
-> the simulator can run every node on one, so crash tests exercise real
-> recovery from disk rather than a model of it. There is still no network and
-> no gRPC: the driver is stepped by the simulator, and the goroutine loop
-> arrives with phase 5's transport.
+> **Raft elects, replicates, survives restarts and compacts.** Each node
+> persists to a write-ahead log that recovers from a crash at any byte. Once a
+> threshold of entries has been applied it snapshots its state machine and
+> deletes the log segments the snapshot supersedes. A follower that falls
+> behind the compacted prefix, or loses its data directory, is caught up by a
+> chunked InstallSnapshot. The replicated key-value store and its session table
+> exist and are snapshotted. There is still no network and no gRPC: the driver
+> is stepped by the simulator, and the goroutine loop and client API arrive
+> with phase 5.
 
 ---
 
@@ -37,8 +40,8 @@ updated at the end of every phase.
 | 1 | Foundations and design | ✅ **complete** |
 | 2 | Core consensus: election and log replication | ✅ **complete** |
 | 3 | Crash-safe persistence | ✅ **complete** |
-| 4 | Snapshotting and log compaction | ⬜ next |
-| 5 | gRPC KV service, linearizable reads, deduplication | ⬜ not started |
+| 4 | Snapshotting and log compaction | ✅ **complete** |
+| 5 | gRPC KV service, linearizable reads, deduplication | ⬜ next |
 | 6 | Fault-injection suite and bug log | ⬜ not started |
 | 7 | Live cluster visualizer | ⬜ not started |
 | 8 | Integration, documentation and demo | ⬜ not started |
@@ -54,11 +57,12 @@ when all of them pass and `make ci` is green.
 
 | Path | State |
 |---|---|
-| `raft/` | **The consensus core.** Leader election with randomized timeouts, log replication with prevLog consistency checks and conflict-term backoff, the Figure 8 commit rule, and the Step/Ready protocol. No I/O, no clock, no goroutines, no locks - enforced by `purity_test.go`. |
-| `internal/storage/` | **The durability boundary.** `WAL`: segmented write-ahead log, one CRC-framed record and at most one fsync per Ready, recovery that truncates a torn tail and refuses any other damage, fsync counters and latency in `WALStats`. `MemStorage`: the simulator's model of the same contract, sharing the batch logic so the two cannot disagree. |
+| `raft/` | **The consensus core.** Leader election with randomized timeouts, log replication with prevLog consistency checks and conflict-term backoff, the Figure 8 commit rule, the Step/Ready protocol, and log compaction: `Node.Compact`, chunked resumable `InstallSnapshot`, Figure 13's install rule. No I/O, no clock, no goroutines, no locks - enforced by `purity_test.go`. |
+| `internal/storage/` | **The durability boundary.** `WAL`: segmented write-ahead log, one CRC-framed record and at most one fsync per Ready, recovery that truncates a torn tail and refuses any other damage, fsync counters and latency in `WALStats`. `SaveSnapshot`: `.snap` file, then a pointer record carrying the log tail and hard state at the head of a fresh segment, then deletion of everything older. Recovery starts from the last pointer. `MemStorage`: the simulator's model of the same contract, sharing the log logic (`logstate.go`) so the two cannot disagree. |
+| `internal/statemachine/` | **The replicated key-value store** with its client session table: put, delete, `(client_id, seq)` deduplication with a cached response, and a deterministic snapshot of data and sessions together. Not yet served over gRPC. |
 | `internal/transport/` | `Transport` interface (Send only - see DESIGN.md §10) and `inmem/`, a deterministic bus with drops, delays, duplication, reordering and directed (one-way capable) partitions, all seeded. |
-| `internal/server/` | The driver: the one place Ready ordering is decided, plus the `tick_lag` metrics. Shared by the simulator and, from phase 5, the real goroutine loop. |
-| `internal/testutil/` | The simulated cluster and the invariant checkers. Storage is pluggable: `MemStorageFactory` (default) or `WALStorageFactory` to put every node on a real WAL. |
+| `internal/server/` | The driver: the one place Ready ordering is decided (now with a step 0 for an installed snapshot), compaction at a threshold (`SetSnapshotThreshold`, `MaybeSnapshot`), plus the `tick_lag` metrics. Shared by the simulator and, from phase 5, the real goroutine loop. |
+| `internal/testutil/` | The simulated cluster and the invariant checkers, now compaction-aware and with a seventh invariant, SnapshotFidelity. Storage is pluggable (`MemStorageFactory`, `WALStorageFactory`), and so is the state machine: the default `Digest` is a running hash of everything applied. |
 | `internal/pbconv/` | Core types to protobuf and back, so `raft/` never imports the protobuf runtime. |
 | `internal/config/` | Loads and strictly validates `cluster.yaml`. |
 | `proto/`, `gen/` | Schemas and checked-in generated code. `buf lint` clean. |
@@ -66,8 +70,7 @@ when all of them pass and `make ci` is green.
 
 ### Documented stubs (a `doc.go` each, no logic)
 
-`internal/statemachine/` (phase 5) - `internal/transport/grpcx/` (phase 5) -
-`internal/kvservice/` (phase 5) - `internal/admin/` (phase 6/7) -
+`internal/transport/grpcx/` (phase 5) - `internal/kvservice/` (phase 5) - `internal/admin/` (phase 6/7) -
 `internal/client/` (phase 5) - `internal/supervisor/` (phase 6) -
 `cmd/quorum-viz/` (phase 7)
 
@@ -79,7 +82,7 @@ a package** - it is the spec.
 
 ## What is actually verified
 
-72 test and fuzz functions across 7 packages. What each group proves:
+100 test and fuzz functions across 8 packages. What each group proves:
 
 **The consensus core stays pure** - `raft/purity_test.go`
 
@@ -130,6 +133,33 @@ a package** - it is the spec.
 - `TestWALAgreesWithMemStorage`: the simulator's crash model and the real log
   agree after reopening.
 
+**Snapshots and compaction** - `internal/testutil/snapshot_test.go`, `internal/storage/snapshot_test.go`, `internal/statemachine/`, `raft/snapshot_test.go`
+
+- `TestSnapshotAtThreshold`: crossing the threshold writes a `.snap` file and
+  deletes `000001.log`; below it, neither happens.
+- `TestSnapshotRestoreIsIdentical`: crash every node, restart from snapshot
+  plus a 17-entry WAL tail, and each state-machine hash (data and sessions) is
+  identical to before the crash.
+- `TestFarBehindFollowerGetsSnapshot`: `MsgInstallSnapshot` counted at the
+  transport, at least three 16-byte chunks, on a clean and a lossy network,
+  and the follower ends with the leader's state hash.
+- `TestSessionsSurviveSnapshot`: a write that survives only in the snapshot's
+  session table is still recognized as a duplicate after a full-cluster
+  restart, with `duplicate = true` and the original applied index.
+- `TestCrashDuringSnapshot`: five crash points in `SaveSnapshot` on the real
+  WAL, each recovering to exactly the state before or after the snapshot and
+  then accepting further writes.
+- `TestWipedNodeCatchesUp`: a node whose data directory is deleted comes back
+  empty and is caught up by snapshot to the leader's exact state.
+- `TestRandomizedTrialsUpholdSafetyWithSnapshots`: the randomized trials with
+  compaction every 15 entries. About 1,600 snapshots taken and 277 installed,
+  in memory and on disk, all invariants checked after every tick.
+- `TestNoSendBeforeSync` snapshot variants: about 137,000 messages audited
+  across about 2,200 snapshot saves.
+- `TestWALAgreesWithMemStorageThroughSnapshots`, `TestRefusedRecoveryReleasesTheLog`,
+  and core unit tests for chunk reassembly, Figure 13, stale snapshots and
+  `Compact`'s refusals.
+
 **The fiddly Figure 2 mechanics** - `raft/node_test.go`, `raft/figure8_test.go`
 
 - `TestUpToDateComparison`, `TestElectionTimerResetDiscipline`,
@@ -155,6 +185,13 @@ Per [CLAUDE.md](CLAUDE.md), a checker nobody has seen fail is not evidence.
 | Durability-ordering audit | send-before-persist and send-before-sync drivers (`TestDurabilityAuditCatchesMisorderedDrivers`) |
 | Double-vote check | storage that forgets its vote (`TestDoubleVoteCheckCatchesAmnesia`) |
 | Whole-cluster restart check | storage that loses a committed entry: *node 1 re-applied 88 entries, but 89 were committed before the crash* |
+| SnapshotFidelity | a restore that flips one bit: *node 2 reached state 5984...308 at index 20 by restoring a snapshot, but node 1 reached 5984...309 there by applying* |
+| Snapshot restore check | a restore that drops a key (`TestRestoreCheckCatchesALossyRestore`); its first run was **not** caught, see BUGS.md |
+| InstallSnapshot count | a follower only a few entries behind must see zero (`TestSnapshotCountIsZeroForANearbyFollower`) |
+| Session-survival check | a snapshot without its session table: *node 1 applied the retry of (client 2, seq 5) at index 25 as new (status STATUS_SESSION_EXPIRED)* |
+| Snapshot crash check | segments deleted before the pointer was durable (`TestSnapshotCrashCheckCatchesMisorderedWrites`) |
+| Durability audit, snapshots | an acknowledgement sent before its snapshot was durable: *acknowledging index 9 with only 0 entries durable* |
+| Compaction-aware checkers | hand-built violations in logs that start at different indices (`TestCheckerHandlesCompactedLogs`) |
 
 `TestCheckerAcceptsAHealthyHistory` is the other half for the Raft checkers,
 and the durability audit has its own: a correct Ready spanning two terms must
@@ -197,57 +234,84 @@ form, so nothing gets re-litigated by accident:
   durable. Reasoning in PLAN.md and DESIGN.md §10.
 - **`WalEntryBatch` gained a `hard_state` field** so a Ready is one record.
   A new field number, accepted by `buf breaking`; DESIGN.md §10.
+- **Phase 4 built the key-value state machine** (`internal/statemachine`),
+  which PLAN.md lists under phase 5. Criterion 4, dedup surviving a snapshot,
+  cannot be tested against anything less. The gRPC service and client library
+  are untouched and remain phase 5.
+- **Two more format additions, both new field numbers** accepted by
+  `buf breaking`: `WalSnapshotPointer` gained `hard_state` and `entries`, so
+  recovery can start from the pointer alone, and `InstallSnapshotResponse`
+  gained `metadata`. Also new: `quorum.kv.v1.StateMachineSnapshot` and its
+  parts. DESIGN.md §10, phase 4, has the reasoning for all of it.
+- **A Ready that installs a snapshot costs more than one fsync** (the file,
+  the pointer, then the batch). They are counted apart, in
+  `WALStats.SnapshotFsyncs`, so "one fsync per Ready with durable state" still
+  holds exactly for `Fsyncs`.
+- **`TestWipedNodeCatchesUp` carries a caveat**: a wiped node forgets its vote.
+  The test is safe because no election is in progress when it returns. Nothing
+  claims wiping is safe in general; DESIGN.md §10.
 
 ---
 
 ## Open items
 
-Nothing is blocking phase 4. Carried forward:
+Nothing is blocking phase 5. Carried forward:
 
-- **goleak is deferred again, to phase 5.** Phase 3 added no goroutines; the
-  first one is the driver loop, which needs phase 5's transport.
-- **`WAL.InitialState` returns applied = 0**, and `MemStorage.SetApplied` is
-  still never called, so a restarted node re-applies its whole log. Correct,
-  and phase 4's snapshots are what fix the cost.
-- **Recovery refuses `WalSnapshotPointer` records** with an error naming
-  phase 4. The codec already round-trips and fuzzes them.
-- **The WAL keeps the recovered log in memory** alongside the core's copy until
-  the process exits. Bounded by compaction in phase 4.
+- **goleak is deferred to phase 5.** Still no goroutines; the first is the
+  driver loop, which needs phase 5's transport.
+- **Snapshots live in memory.** The core keeps the latest image to send, and a
+  follower builds an incoming one in memory. Fine for a demo-sized store; a
+  large one would stream from the file. DESIGN.md §10.
+- **The WAL keeps a copy of the log after the snapshot in memory**, which the
+  pointer record needs. Bounded by compaction now.
+- **No compaction margin.** The leader compacts to its applied index, so a
+  follower only slightly behind gets a snapshot rather than a few entries.
+  Correct; a throughput tuning, out of scope.
+- **Session expiry is not implemented.** Sessions are never garbage-collected,
+  so `STATUS_SESSION_EXPIRED` is only returned for a client id that was never
+  registered. Phase 5 decides whether to add expiry.
 - **Mid-segment media corruption in the last segment** is indistinguishable
   from a torn tail and is truncated. Outside the crash-fault model; stated in
   DESIGN.md §2.
 - **`Mutation` ships in production code** so the negative controls can reach it
   from another package. Fenced by `TestZeroConfigIsUnmutated` and
   `TestEveryMutationIsDistinct`; reasoning in DESIGN.md §10.
-- **`InstallSnapshot` message types exist but are rejected.** Phase 4.
-- **The claim-to-test traceability table** (DESIGN.md §7) now has 35 rows
+- **The claim-to-test traceability table** (DESIGN.md §7) now has 50 rows
   filled. Phase 6 requires it complete.
 - **No CI runner is configured.** `make ci` passes locally.
 
 ---
 
-## Next: phase 4
+## Next: phase 5
 
-**Goal.** History is compacted so a lagging or rejoining node catches up quickly
-instead of replaying everything.
+**Goal.** GET and PUT over gRPC that are linearizable, and retries that cannot
+double-apply.
 
 Full acceptance criteria: [PLAN.md](PLAN.md).
 
-What phase 3 left in place:
+What phase 4 left in place:
 
-1. The snapshot write sequence is already specified (DESIGN.md §2: payload,
-   then pointer, then delete superseded segments) and the pointer record
-   already round-trips through the codec. Recovery currently refuses it; phase
-   4 gives it a meaning.
-2. Segments exist precisely so that compaction can delete a prefix a file at a
-   time. `listSegments` requires consecutive numbering from wherever the log
-   starts, not from 1, so deleting leading segments needs no format change.
-3. The simulator already runs nodes on a real WAL
-   (`testutil.WALStorageFactory`), so "crash at each step of snapshotting" can
-   be tested with real files.
+1. `statemachine.KV` already applies commands, deduplicates by
+   `(client_id, seq)`, and reports each outcome as a `Result` through
+   `OnApply`: `Duplicate`, `AppliedIndex`, `Existed`, `Status`. That is the
+   payload phase 5's pending-proposal registry hands back to a waiting RPC.
+   `statemachine.EncodePut`, `EncodeDelete` and `EncodeRegister` build log
+   payloads.
+2. `server.StateMachine` now includes `Snapshot` and `Restore`, and the driver
+   compacts at a threshold. The real node wires `SetSnapshotThreshold` from
+   `raft.snapshot_threshold_entries` in `cluster.yaml`, and restores the state
+   machine from `storage.Recovered.Snapshot` before building the node, as
+   `testutil.Cluster.newReplica` does.
+3. `pbconv` converts every message type, InstallSnapshot included, so the gRPC
+   transport needs no new conversion code. The 64 KiB default chunk is well
+   under gRPC's 4 MiB default message limit.
 
-Watch for: the recovered commit index is checked against the last recovered
-entry; after compaction that check must account for the snapshot's index.
+Watch for:
+
+- ReadIndex needs `read_context` carried on AppendEntries and echoed back. The
+  wire format has the field; the core does not use it yet.
+- The single driver goroutine owning `*raft.Node` is the rule (CLAUDE.md
+  §3.3), and a gRPC handler must not call into the core directly.
 
 ---
 
@@ -316,3 +380,39 @@ BUGS.md note named a metric (`fsync_p99_micros`) that has never existed.
 
 Verified: `make ci` green; every new checker observed failing on a deliberately
 broken input; `buf breaking` clean against the previous commit.
+
+### Phase 4 - 2026-09-30
+
+Implemented log compaction end to end. In the core: `Compact`, chunked,
+resumable `InstallSnapshot` and Figure 13's install rule. In storage:
+`SaveSnapshot` for both the WAL and `MemStorage`, recovery from the last
+snapshot pointer, and deletion of superseded segments and files. In the driver:
+compaction at a threshold, and snapshot installation ahead of the Ready's other
+durable writes. Built the key-value state machine and its session table,
+earlier than planned, because criterion 4 needs the real thing.
+
+Three format additions, all new field numbers, and the reasoning for each is
+in DESIGN.md §10. The pointer record carries the log tail and hard state, so
+segment deletion order stops mattering. The snapshot acknowledgement names its
+snapshot. The state-machine snapshot has a schema.
+
+The invariant checkers compared logs by position, which compaction breaks.
+They now compare by index, and gained SnapshotFidelity, which compares every
+replica's state hash at every applied index.
+
+Found three real bugs, all recorded in BUGS.md with regression tests observed
+failing first:
+
+- recovery leaked the tail segment's file handle when it refused to start
+  (a phase 3 defect, caught by Windows refusing to delete an open file);
+- the restore-identity test could not detect lost data, caught by its negative
+  control not failing;
+- snapshot sending mistook "past the end of the log" for "compacted", caught
+  by the phase 2 mutation controls.
+
+No consensus or storage-correctness bug was found. BUGS.md records that too,
+and why it counts for something.
+
+Verified: `make ci` green, `buf lint` and `buf breaking` clean,
+`make proto-check` clean with `gen/` staged, and every new check observed
+failing on a deliberately broken input.

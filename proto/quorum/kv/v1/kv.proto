@@ -59,6 +59,55 @@ message RegisterClientCommand {
 }
 
 // ---------------------------------------------------------------------------
+// State machine snapshot
+// ---------------------------------------------------------------------------
+
+// StateMachineSnapshot is the complete image of a replica's state machine as of
+// applied_index: the key-value data AND the session table.
+//
+// The session table is here, not in process memory, because a node that
+// restarts from a snapshot -- or catches up by receiving one -- must still
+// recognize a retried (client_id, seq) as a duplicate. Leaving it out would
+// make exactly-once delivery silently lapse on every compaction.
+//
+// Both lists are sorted (by key, by client id), so two replicas in the same
+// state produce byte-identical snapshots. That is what lets a test compare
+// replicas by hashing their snapshots.
+message StateMachineSnapshot {
+  uint64 applied_index = 1;
+  repeated KeyValue data = 2;
+  repeated Session sessions = 3;
+}
+
+message KeyValue {
+  string key = 1;
+  bytes value = 2;
+}
+
+// Session is one client's deduplication state.
+message Session {
+  uint64 client_id = 1;
+
+  // last_seq is the highest seq applied for this client. A command with a
+  // seq at or below it is a retry and is not applied again.
+  uint64 last_seq = 2;
+
+  // last_response is what the command at last_seq returned, replayed
+  // verbatim to a retry of it.
+  CachedResponse last_response = 3;
+}
+
+// CachedResponse is the part of a write's response that depends on applying
+// it, and so has to be remembered to answer a retry identically.
+message CachedResponse {
+  uint64 applied_index = 1;
+
+  // existed is DeleteResponse.existed: whether the key was present when the
+  // delete was first applied.
+  bool existed = 2;
+}
+
+// ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
 

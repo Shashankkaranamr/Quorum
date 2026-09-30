@@ -8,16 +8,26 @@ import (
 	"github.com/Shashankkaranamr/Quorum/raft"
 )
 
-// StateMachine consumes committed entries.
+// StateMachine consumes committed entries, and can be captured into and
+// rebuilt from a snapshot.
 //
 // Declared here rather than imported from internal/statemachine because this is
 // the consumer, and a consumer-side interface keeps the driver testable without
-// dragging in the real key-value store. Phase 5's state machine satisfies it.
+// dragging in the real key-value store. statemachine.KV satisfies it.
 type StateMachine interface {
 	// Apply must be deterministic. Every replica applying the same entry at
 	// the same index must reach the same state, so nothing here may consult
 	// the clock, the network or a random source.
 	Apply(entries []raft.Entry) error
+
+	// Snapshot captures the complete state as of the last applied entry, and
+	// reports that entry's index. The driver checks it against the core's
+	// applied index: a snapshot filed under the wrong index would restore a
+	// replica to a state no other replica ever passed through.
+	Snapshot() ([]byte, raft.Index, error)
+
+	// Restore replaces the complete state with a snapshot's.
+	Restore(snap raft.Snapshot) error
 }
 
 // Metrics are the numbers that make the known hazards measurable rather than
@@ -51,6 +61,11 @@ type Metrics struct {
 	// taken over a run rather than only the worst case.
 	TotalTickLagTicks uint64
 
+	// SnapshotsTaken counts compactions this node made of its own log, and
+	// SnapshotsInstalled counts snapshots it accepted from a leader.
+	SnapshotsTaken     uint64
+	SnapshotsInstalled uint64
+
 	// SendBeforeSyncViolations must always be zero. It counts the one thing
 	// this loop exists to prevent: a message leaving the process before the
 	// state it promises is durable. A non-zero value is a safety bug, not a
@@ -78,6 +93,10 @@ type Driver struct {
 	metrics      Metrics
 	pendingTicks uint64
 
+	// snapshotThreshold is how many applied entries may accumulate past the
+	// last snapshot before the log is compacted. Zero disables compaction.
+	snapshotThreshold uint64
+
 	// syncedThisReady guards the ordering rule within one batch.
 	syncedThisReady bool
 }
@@ -86,6 +105,11 @@ type Driver struct {
 func New(node *raft.Node, store storage.Storage, trans transport.Transport, sm StateMachine) *Driver {
 	return &Driver{node: node, store: store, trans: trans, sm: sm}
 }
+
+// SetSnapshotThreshold turns on log compaction: once this many entries have
+// been applied past the last snapshot, the next Run captures the state machine
+// and compacts the log up to it. Zero, the default, never compacts.
+func (d *Driver) SetSnapshotThreshold(entries uint64) { d.snapshotThreshold = entries }
 
 // Node exposes the core for inspection. Callers must not step it directly.
 func (d *Driver) Node() *raft.Node { return d.node }
@@ -109,7 +133,8 @@ func (d *Driver) Propose(typ raft.EntryType, data []byte) (raft.Index, raft.Term
 	return d.node.Propose(typ, data)
 }
 
-// Run hands over any accumulated ticks and processes one Ready batch.
+// Run hands over any accumulated ticks, processes one Ready batch, and compacts
+// the log if it has grown past the snapshot threshold.
 func (d *Driver) Run() error {
 	if lag := d.pendingTicks; lag > 1 {
 		if excess := lag - 1; excess > d.metrics.MaxTickLagTicks {
@@ -124,18 +149,66 @@ func (d *Driver) Run() error {
 		d.metrics.TicksProcessed++
 	}
 
-	return d.ProcessReady()
+	if err := d.ProcessReady(); err != nil {
+		return err
+	}
+	return d.MaybeSnapshot()
+}
+
+// MaybeSnapshot compacts the log if enough has been applied since the last
+// snapshot.
+//
+// It runs between Readies, never inside one, so nothing is buffered in storage
+// and the state machine is exactly at the core's applied index. The order is
+// capture, compact the core, persist:
+//
+//  1. The state machine renders itself as of its last applied entry.
+//  2. The core drops the entries that image covers and keeps the image, so it
+//     can send it to a follower that needs one.
+//  3. Storage writes the snapshot file, then the pointer, then deletes the
+//     segments it supersedes.
+//
+// A crash between 2 and 3 costs nothing: the core's compaction lived only in
+// memory, and the node comes back with its full log on disk. Nothing is sent
+// in between, so no other node can have acted on the compacted state.
+func (d *Driver) MaybeSnapshot() error {
+	if d.snapshotThreshold == 0 || d.sm == nil {
+		return nil
+	}
+	applied := d.node.Applied()
+	if uint64(applied-d.node.SnapshotIndex()) < d.snapshotThreshold {
+		return nil
+	}
+
+	data, at, err := d.sm.Snapshot()
+	if err != nil {
+		return fmt.Errorf("capture snapshot: %w", err)
+	}
+	if at != applied {
+		return fmt.Errorf("state machine snapshot is at index %d but the core has applied %d; "+
+			"the two have diverged", at, applied)
+	}
+	snap, err := d.node.Compact(at, data)
+	if err != nil {
+		return fmt.Errorf("compact log to %d: %w", at, err)
+	}
+	if err := d.store.SaveSnapshot(snap); err != nil {
+		return fmt.Errorf("save snapshot at %d: %w", at, err)
+	}
+	d.metrics.SnapshotsTaken++
+	return nil
 }
 
 // ProcessReady carries out one Ready batch in the order correctness requires.
 //
 // This ordering is the single most load-bearing sequence in the project:
 //
+//  0. Save snapshot           durable on return, only when one was received
 //  1. Append entries          buffered
 //  2. Set hard state          buffered
 //  3. Sync                    the fsync -- exactly one per batch
 //  4. Send messages           never before step 3 returns
-//  5. Apply committed         never before step 3 returns
+//  5. Restore, then apply     never before step 3 returns
 //  6. Advance                 acknowledge the batch
 //
 // Steps 4 and 5 come after 3 because a granted vote and an accepted
@@ -151,6 +224,17 @@ func (d *Driver) ProcessReady() error {
 	rd := d.node.Ready()
 	d.metrics.ReadyBatches++
 	d.syncedThisReady = false
+
+	// 0. A snapshot from the leader. The follower's acknowledgement of it is
+	//    in rd.Messages, and says "I hold everything up to its index", so it
+	//    must be durable before step 4 exactly as appended entries must be.
+	//    It goes first because the entries below continue from it.
+	if rd.Snapshot != nil {
+		if err := d.store.SaveSnapshot(*rd.Snapshot); err != nil {
+			return fmt.Errorf("save received snapshot at %d: %w", rd.Snapshot.Meta.Index, err)
+		}
+		d.metrics.SnapshotsInstalled++
+	}
 
 	// 1. Entries.
 	if len(rd.Entries) > 0 {
@@ -188,7 +272,13 @@ func (d *Driver) ProcessReady() error {
 		d.metrics.MessagesSent += uint64(len(rd.Messages))
 	}
 
-	// 5. Apply.
+	// 5. Restore, then apply. The committed entries continue from the
+	//    snapshot, so the state machine must be at its index first.
+	if rd.Snapshot != nil && d.sm != nil {
+		if err := d.sm.Restore(*rd.Snapshot); err != nil {
+			return fmt.Errorf("restore snapshot at %d: %w", rd.Snapshot.Meta.Index, err)
+		}
+	}
 	if len(rd.CommittedEntries) > 0 {
 		if d.sm != nil {
 			if err := d.sm.Apply(rd.CommittedEntries); err != nil {

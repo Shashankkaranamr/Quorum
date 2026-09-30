@@ -47,11 +47,38 @@ type Node struct {
 	// pendingReady guards against a caller taking two Readys without an
 	// Advance between them, which would silently drop work.
 	pendingReady bool
+
+	// readyStable and readyApplied are what the outstanding Ready covered.
+	// Advance moves the log's durable and applied marks to exactly these,
+	// never to whatever the log holds by the time Advance is called.
+	readyStable  Index
+	readyApplied Index
+
+	// snapshot is the latest snapshot this node holds, kept so that as leader
+	// it can send it to a follower behind the compacted prefix. Its Data is
+	// never inspected.
+	snapshot Snapshot
+
+	// pendingSnapshot is a snapshot accepted from the leader that the next
+	// Ready must persist and restore before anything else.
+	pendingSnapshot *Snapshot
+
+	// incoming accumulates the chunks of a snapshot being received.
+	incoming incomingSnapshot
 }
 
-// New creates a node from cfg. Restored state in cfg (HardState, Entries,
-// Applied) is adopted as-is, which is how phase 3 will bring a node back from
-// its write-ahead log.
+// incomingSnapshot is a partially received snapshot. It lives in memory only:
+// a follower that restarts mid-transfer reports zero bytes received and the
+// leader starts again, which is simpler than persisting partial state and
+// costs one retransfer in a rare case.
+type incomingSnapshot struct {
+	meta SnapshotMeta
+	data []byte
+}
+
+// New creates a node from cfg. Restored state in cfg (HardState, Snapshot,
+// Entries, Applied) is adopted as-is, which is how a node comes back from its
+// write-ahead log.
 func New(cfg Config) (*Node, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -61,7 +88,8 @@ func New(cfg Config) (*Node, error) {
 		cfg:      cfg,
 		id:       cfg.ID,
 		peers:    append([]NodeID(nil), cfg.Peers...),
-		log:      newLog(cfg.Entries, cfg.Applied),
+		log:      newLog(cfg.Snapshot.Meta, cfg.Entries, cfg.Applied),
+		snapshot: cfg.Snapshot,
 		votes:    make(map[NodeID]bool, len(cfg.Peers)),
 		progress: make(map[NodeID]*Progress, len(cfg.Peers)),
 	}
@@ -162,8 +190,10 @@ func (n *Node) Step(m Message) error {
 		n.handleAppendEntries(m)
 	case MsgAppendEntriesResp:
 		n.handleAppendEntriesResponse(m)
-	case MsgInstallSnapshot, MsgInstallSnapshotResp:
-		return fmt.Errorf("raft: %s is not implemented until phase 4", m.Type)
+	case MsgInstallSnapshot:
+		n.handleInstallSnapshot(m)
+	case MsgInstallSnapshotResp:
+		n.handleInstallSnapshotResponse(m)
 	default:
 		return fmt.Errorf("raft: unknown message type %s", m.Type)
 	}
@@ -200,6 +230,8 @@ func (n *Node) replyToStaleMessage(m Message) {
 		n.send(Message{Type: MsgRequestVoteResp, To: m.From, VoteGranted: false})
 	case MsgAppendEntries:
 		n.send(Message{Type: MsgAppendEntriesResp, To: m.From, Success: false})
+	case MsgInstallSnapshot:
+		n.send(Message{Type: MsgInstallSnapshotResp, To: m.From, SnapshotMeta: m.SnapshotMeta})
 	}
 }
 
@@ -298,6 +330,7 @@ func (n *Node) HasReady() bool {
 		return false
 	}
 	return len(n.msgs) > 0 ||
+		n.pendingSnapshot != nil ||
 		len(n.log.unstableEntries()) > 0 ||
 		len(n.log.nextApplicable()) > 0 ||
 		n.hardState() != n.prevHardState
@@ -315,6 +348,7 @@ func (n *Node) Ready() Ready {
 	n.pendingReady = true
 
 	rd := Ready{
+		Snapshot:         n.pendingSnapshot,
 		Entries:          n.log.unstableEntries(),
 		Messages:         n.msgs,
 		CommittedEntries: n.log.nextApplicable(),
@@ -322,6 +356,11 @@ func (n *Node) Ready() Ready {
 	if hs := n.hardState(); hs != n.prevHardState {
 		copied := hs
 		rd.HardState = &copied
+	}
+	n.readyStable = n.log.lastIndex()
+	n.readyApplied = n.log.applied
+	if k := len(rd.CommittedEntries); k > 0 {
+		n.readyApplied = rd.CommittedEntries[k-1].Index
 	}
 	n.msgs = nil
 	return rd
@@ -338,11 +377,13 @@ func (n *Node) Advance() {
 		return
 	}
 	n.pendingReady = false
+	n.pendingSnapshot = nil
 
-	n.log.stable = n.log.lastIndex()
-	if n.log.applied < n.log.committed {
-		n.log.applied = n.log.committed
-	}
+	// Clamp to the log as it is now: nothing in the core truncates between
+	// Ready and Advance today, but durability must never be claimed for an
+	// entry that no longer exists.
+	n.log.stable = max(n.log.stable, min(n.readyStable, n.log.lastIndex()))
+	n.log.applied = max(n.log.applied, n.readyApplied)
 	n.prevHardState = n.hardState()
 
 	if n.isLeader() {
@@ -387,6 +428,8 @@ func (n *Node) Status() Status {
 		LastLogIndex:    n.log.lastIndex(),
 		LastLogTerm:     n.log.lastTerm(),
 		StableIndex:     n.log.stable,
+		SnapshotIndex:   n.log.snapIndex,
+		SnapshotTerm:    n.log.snapTerm,
 		LogRevision:     n.log.revision,
 		ElectionElapsed: n.electionElapsed,
 		ElectionTimeout: n.electionTimeout,
@@ -400,13 +443,46 @@ func (n *Node) Status() Status {
 	return s
 }
 
-// LogEntries returns a copy of the whole log.
+// LogEntries returns a copy of the log after the snapshot: every entry above
+// Status().SnapshotIndex.
 //
 // It is O(n) and exists for inspection: the admin API's log tail and, above
 // all, the invariant checkers, which cannot verify Log Matching without seeing
 // both logs in full.
 func (n *Node) LogEntries() []Entry {
 	return append([]Entry(nil), n.log.entries...)
+}
+
+// Applied is the index of the last entry the state machine has applied, as of
+// the last Advance. It is the highest index Compact will accept.
+func (n *Node) Applied() Index { return n.log.applied }
+
+// SnapshotIndex is the last index folded into this node's snapshot.
+func (n *Node) SnapshotIndex() Index { return n.log.snapIndex }
+
+// Compact folds the log up to and including index into a snapshot whose state
+// machine image is data, and returns that snapshot for the caller to persist.
+//
+// data must be the state machine exactly as of index -- which is why index may
+// not exceed Applied. The core keeps the snapshot so that, as leader, it can
+// send it to a follower that needs an entry it no longer has; it never looks
+// inside data.
+//
+// The caller persists the returned snapshot before it next calls Ready. Until
+// then the durable log still holds every compacted entry, so a crash in
+// between loses nothing: the node simply comes back with a longer log.
+func (n *Node) Compact(index Index, data []byte) (Snapshot, error) {
+	if n.pendingReady {
+		return Snapshot{}, fmt.Errorf("raft: Compact called between Ready and Advance")
+	}
+	if err := n.log.compact(index); err != nil {
+		return Snapshot{}, err
+	}
+	n.snapshot = Snapshot{
+		Meta: SnapshotMeta{Index: n.log.snapIndex, Term: n.log.snapTerm},
+		Data: data,
+	}
+	return n.snapshot, nil
 }
 
 // Campaign starts an election immediately, without waiting for the election

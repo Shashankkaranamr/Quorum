@@ -9,7 +9,7 @@ that would fail if the claim were untrue, or says which phase adds that test.
 Where it claims less than the reader might assume, it says so explicitly —
 see [§6, What this will and will not guarantee](#6-what-this-will-and-will-not-guarantee).
 
-**Status:** phase 3 of 8 complete. Sections 1–6 are decided. Where the
+**Status:** phase 4 of 8 complete. Sections 1–6 are decided. Where the
 implementation has since diverged from them, §10 records what changed and why;
 see [PLAN.md](PLAN.md) for the roadmap and [PROGRESS.md](PROGRESS.md) for where
 the work actually is.
@@ -302,10 +302,17 @@ get right, one to fuzz.**
   success for data that is gone. The only safe recovery is a restart that
   re-reads the disk.
 - **Payload before pointer, for snapshots.** Write and fsync the `.snap` file;
-  *then* append and fsync a `WalSnapshotPointer`; *then* delete superseded WAL
-  segments. A pointer therefore always names a complete file, and a complete
-  file with no pointer is simply ignored. A crash at any point in the sequence
-  is recoverable, which phase 4 tests by crashing at each step.
+  *then* roll to a fresh segment and append and fsync a `WalSnapshotPointer`;
+  *then* delete every older segment and snapshot file. A pointer therefore
+  always names a complete file, and a complete file with no pointer is ignored
+  and removed at the next start. The pointer carries the log entries after the
+  snapshot and the current hard state, so recovery starts at the last segment
+  that begins with one and never needs anything older. That makes deletion
+  order irrelevant: a crash part-way through deleting leaves stale segments
+  that recovery skips and removes. `TestCrashDuringSnapshot` crashes between
+  every pair of steps, and inside the file write, the pointer write and the
+  deletions. Each case must recover to exactly the state before the snapshot or
+  exactly the state after it, and keep working.
 
 ### Scope of the durability guarantee
 
@@ -680,8 +687,21 @@ be complete, and phase 8 requires it to appear in the README.
 | That restart check can actually fail | `TestRestartCheckCatchesLostCommittedEntries` | ✅ 3 |
 | The safety invariants hold with every node on real disk | `TestRandomizedTrialsUpholdSafetyOnDisk` | ✅ 3 |
 | The simulator's crash model matches the real log | `TestWALAgreesWithMemStorage` | ✅ 3 |
-| Snapshot + tail reproduces exact state | `TestSnapshotRestoreIsIdentical` | 4 |
-| Dedup survives snapshot restore | `TestSessionsSurviveSnapshot` | 4 |
+| Crossing the threshold compacts, and deletes the superseded segments | `TestSnapshotAtThreshold` | ✅ 4 |
+| Snapshot + tail reproduces exact state | `TestSnapshotRestoreIsIdentical` | ✅ 4 |
+| That restore check can actually fail | `TestRestoreCheckCatchesALossyRestore` | ✅ 4 |
+| A far-behind follower is caught up by InstallSnapshot, observed being sent | `TestFarBehindFollowerGetsSnapshot` | ✅ 4 |
+| That count is not counting something else | `TestSnapshotCountIsZeroForANearbyFollower` | ✅ 4 |
+| Dedup survives snapshot restore | `TestSessionsSurviveSnapshot` | ✅ 4 |
+| That session check can actually fail | `TestSessionCheckCatchesASessionlessSnapshot` | ✅ 4 |
+| A crash at any point while snapshotting is recoverable | `TestCrashDuringSnapshot` | ✅ 4 |
+| That crash check can actually fail | `TestSnapshotCrashCheckCatchesMisorderedWrites` | ✅ 4 |
+| A node whose data directory is deleted rejoins by snapshot | `TestWipedNodeCatchesUp` | ✅ 4 |
+| Every replica's state is identical at every index, applied or restored | `SnapshotFidelity` checker, every tick of `TestRandomizedTrialsUpholdSafetyWithSnapshots` | ✅ 4 |
+| That checker can actually fail | `TestSnapshotFidelityCatchesACorruptTransfer`, `TestCheckerHandlesCompactedLogs` | ✅ 4 |
+| A snapshot is never acknowledged before it is durable | `TestNoSendBeforeSync` (snapshot variants) | ✅ 4 |
+| That audit can actually fail for snapshots | `TestDurabilityAuditCatchesAnEarlySnapshotAck` | ✅ 4 |
+| The simulator's storage matches the real log through snapshots | `TestWALAgreesWithMemStorageThroughSnapshots` | ✅ 4 |
 | A partitioned leader will not serve a stale read | `TestPartitionedLeaderRefusesRead` | 5 |
 | A retried write applies exactly once | `TestAmbiguousRetryAppliesOnce` | 5 |
 | Client histories are linearizable | `TestLinearizabilityUnderFaults` (Porcupine) | 5 |
@@ -832,3 +852,102 @@ simulator refuses it, because a crash that cost nothing would prove nothing.
 **goleak moves to phase 5.** This phase added no goroutines. The driver loop
 that will be the first one needs a transport that can deliver inbound
 messages, and that is phase 5's gRPC transport.
+
+### Phase 4
+
+**`WalSnapshotPointer` gained `hard_state` and `entries`, and a pointer is
+always the first record of a fresh segment.** §2 described the pointer as
+naming a file and nothing more, with deletion of superseded segments to follow.
+Deletion order is not durable: without a directory fsync per delete, a crash
+can leave any subset of the deleted segments behind, including one with a gap
+in the middle, which phase 3's recovery rightly refuses. So the pointer now
+carries everything the node still needs from before it, meaning the log entries
+after the snapshot and the current hard state, and SaveSnapshot rolls to a new
+segment before writing it. Recovery starts at the last segment that begins with
+a pointer, ignores anything older, and removes it. The deleted segments can
+then disappear in any order, and a crash part-way through leaves nothing
+recovery has to reason about. It stays one record under one CRC, like
+`WalEntryBatch`. These are new field numbers, which `buf breaking` accepts.
+
+**`InstallSnapshotResponse` gained `metadata`, and the last chunk is
+acknowledged with an `AppendEntriesResponse`.** A `bytes_received` on its own
+does not say which snapshot it counts. An acknowledgement delayed past the
+leader's next compaction would then be read as progress on the newer
+snapshot. Once the last chunk is installed, the follower's log agrees with the
+leader's up to the snapshot index. Answering with an AppendEntries success at
+that index lets ordinary replication resume with no second protocol for "done".
+etcd does the same.
+
+**`Storage.SaveSnapshot` does not buffer.** Append and SetHardState buffer
+until Sync. A snapshot is durable when SaveSnapshot returns. It is called
+either between Readies, for a snapshot the node took itself, or as step 0 of a
+Ready that installs one from the leader, before that Ready's entries are
+buffered. A Ready carrying a snapshot therefore costs more than one fsync: the
+snapshot file, the pointer, and then the batch. `WALStats.SnapshotFsyncs`
+counts the first two separately, so the invariant "one fsync per Ready with
+durable state" still describes `Fsyncs` exactly. `InitialState` now returns a
+`Recovered` struct including the snapshot. Its separate applied index is gone,
+because the snapshot's index is the applied index a restarted node starts from.
+
+**The core holds the latest snapshot's bytes in memory.** The core cannot read
+files, and as leader it must send its snapshot to any follower behind the
+compacted prefix. So `Node.Compact` keeps the image the driver hands it, and a
+restarted node receives it back through `Config.Snapshot`. A follower builds an
+incoming snapshot in memory. A follower that restarts mid-transfer reports zero
+bytes received and the leader starts again, rather than persisting partial
+state. For a key-value store sized for a demo this is the right trade. A store
+whose snapshot did not fit in memory would need the transfer to stream from
+the file, which the chunked wire format already allows.
+
+**The state machine arrived in phase 4, not phase 5.** Criterion 4 requires a
+retried `(client_id, seq)` to be deduplicated after a restart from a snapshot.
+That needs the real apply path and session table, not a stand-in.
+`internal/statemachine` is now the key-value store with sessions, the
+deterministic snapshot encoding (`quorum.kv.v1.StateMachineSnapshot`, sorted,
+so equal states give equal bytes) and restore. The client-facing gRPC service
+that proposes into it is still phase 5.
+
+**A follower answers an AppendEntries below its snapshot with success at its
+commit index.** A follower that has installed a snapshot, or compacted past
+where the leader thinks it is, can no longer check an AppendEntries whose
+`prevLogIndex` is below the snapshot. Rejecting it would send a conflict hint
+above the leader's nextIndex. The leader rightly refuses to move forward on a
+rejection, so the two would stall. Everything below the follower's commit index
+is in the leader's log by Leader Completeness, so reporting the commit index is
+safe. A stale InstallSnapshot, one that does not reach past the follower's
+commit index, is answered the same way.
+
+**Compaction is to the applied index, with no retained margin.** The leader
+folds everything the state machine has applied into the snapshot. A follower
+only slightly behind at that moment is then caught up by snapshot instead of by
+a few AppendEntries. That is correct, and costs extra transfer on a busy
+cluster. etcd keeps a margin of entries for this. It is a throughput tuning,
+out of scope by §6, and noted here so it is not mistaken for an oversight.
+
+**The snapshot file is written under its final name, not renamed into place.**
+A rename buys nothing here. The file is not trusted until a durable pointer
+names it, and no pointer is written until the file is fsynced. SaveSnapshot
+refuses any snapshot not newer than the current one, so it can never truncate
+a file an existing pointer names.
+
+**A wiped node forgets its vote.** `TestWipedNodeCatchesUp` deletes a node's
+data directory and requires it to rejoin by snapshot. A wiped node has
+forgotten which candidate it voted for, so in general it could vote twice in
+one term. The test is safe only because no election is in progress when the
+node returns. A production system treats a wiped node as a new member, which
+needs the membership changes deferred in §9. The test's comment says so, and
+nothing here claims that wiping a node is safe in general.
+
+**The invariant checkers compare logs by index, and gained SnapshotFidelity.**
+Once nodes compact on their own schedules, their logs start at different
+indices. Log Matching, Leader Append-Only and Leader Completeness all compared
+positions and had to learn indices. A leader dropping a prefix into a snapshot
+is not an Append-Only violation, and a committed entry inside a new leader's
+snapshot is not missing. SnapshotFidelity is new. Every replica's
+state-machine hash is recorded at every applied index, and any two that differ
+at the same index are a violation, whether a replica got there by applying or
+by restoring. State Machine Safety cannot see entries a replica never applied
+because a snapshot stood in for them, so this is the only check that a snapshot
+carried exactly what the log produced. The simulator's default state machine
+(`testutil.Digest`) is a running hash of everything applied, so the check runs
+in every randomized trial at negligible cost.

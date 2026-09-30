@@ -66,7 +66,8 @@ const (
 	// ReadIndex depends on in phase 5.
 	EntryNoOp EntryType = 2
 
-	// EntrySession registers a client session (phase 5).
+	// EntrySession registers a client session. The client id is the index
+	// the entry lands at.
 	EntrySession EntryType = 3
 
 	// EntryConfig is reserved for membership changes and is not implemented.
@@ -135,10 +136,15 @@ const (
 	MsgAppendEntries
 	MsgAppendEntriesResp
 
-	// MsgInstallSnapshot and its response are declared so that the message
-	// space is fixed now. Phase 4 implements them; until then a node never
-	// produces one, and Step rejects one it is sent.
+	// MsgInstallSnapshot carries one chunk of the leader's snapshot to a
+	// follower whose next entry the leader has already compacted away.
 	MsgInstallSnapshot
+
+	// MsgInstallSnapshotResp acknowledges a chunk that did not complete the
+	// transfer. The chunk that does complete it is acknowledged with an
+	// AppendEntriesResp instead, because from that moment the follower's log
+	// agrees with the leader's up to the snapshot and ordinary replication
+	// takes over.
 	MsgInstallSnapshotResp
 )
 
@@ -206,6 +212,20 @@ type Message struct {
 	// optimization sketched at the end of §5.3).
 	ConflictTerm  Term
 	ConflictIndex Index
+
+	// InstallSnapshot and its response. SnapshotMeta names which snapshot a
+	// chunk or an acknowledgement belongs to, so a chunk of an older snapshot
+	// can never be spliced into a newer one.
+	SnapshotMeta   SnapshotMeta
+	SnapshotOffset uint64
+	SnapshotData   []byte
+	SnapshotDone   bool
+
+	// SnapshotBytesReceived is how much of SnapshotMeta's snapshot the
+	// follower now holds contiguously. The leader resumes from exactly there,
+	// which makes a lost, duplicated or reordered chunk cost a retry rather
+	// than a corrupted image.
+	SnapshotBytesReceived uint64
 }
 
 func (m Message) String() string {
@@ -221,10 +241,38 @@ func (m Message) String() string {
 	case MsgAppendEntriesResp:
 		return fmt.Sprintf("%s %d->%d t%d ok=%v match=%d conflict=%d@%d",
 			m.Type, m.From, m.To, m.Term, m.Success, m.MatchIndex, m.ConflictIndex, m.ConflictTerm)
+	case MsgInstallSnapshot:
+		return fmt.Sprintf("%s %d->%d t%d snap=%d@%d off=%d n=%d done=%v",
+			m.Type, m.From, m.To, m.Term, m.SnapshotMeta.Index, m.SnapshotMeta.Term,
+			m.SnapshotOffset, len(m.SnapshotData), m.SnapshotDone)
+	case MsgInstallSnapshotResp:
+		return fmt.Sprintf("%s %d->%d t%d snap=%d@%d received=%d",
+			m.Type, m.From, m.To, m.Term, m.SnapshotMeta.Index, m.SnapshotMeta.Term, m.SnapshotBytesReceived)
 	default:
 		return fmt.Sprintf("%s %d->%d t%d", m.Type, m.From, m.To, m.Term)
 	}
 }
+
+// SnapshotMeta identifies the point in the log a snapshot replaces: the last
+// entry folded into it. Everything at or below Index is gone from the log and
+// lives only in the snapshot.
+type SnapshotMeta struct {
+	Index Index
+	Term  Term
+}
+
+// Snapshot is a state machine image and the log position it corresponds to.
+//
+// Data is opaque to the core. The core holds on to the latest snapshot only so
+// that, as leader, it can send it to a follower that has fallen behind the
+// compacted prefix; it never looks inside.
+type Snapshot struct {
+	Meta SnapshotMeta
+	Data []byte
+}
+
+// IsEmpty reports whether s is the zero snapshot, i.e. nothing is compacted.
+func (s Snapshot) IsEmpty() bool { return s.Meta.Index == 0 }
 
 // Ready is everything that must happen as a result of the steps taken since the
 // last Ready: what to persist, what to send, and what to apply.
@@ -232,6 +280,13 @@ func (m Message) String() string {
 // The caller decides the ordering, and the ordering is a correctness
 // requirement rather than a performance choice. See internal/server.
 type Ready struct {
+	// Snapshot is non-nil when this node accepted a snapshot from the leader.
+	// It must be made durable before anything in Messages is sent -- the
+	// follower's acknowledgement is a promise that it holds everything up to
+	// the snapshot's index -- and restored into the state machine before
+	// CommittedEntries, which follow on from it.
+	Snapshot *Snapshot
+
 	// HardState is non-nil when term, vote or commit changed and must be made
 	// durable before anything in Messages leaves the process.
 	HardState *HardState
@@ -250,7 +305,8 @@ type Ready struct {
 
 // IsEmpty reports whether there is nothing to do.
 func (rd Ready) IsEmpty() bool {
-	return rd.HardState == nil &&
+	return rd.Snapshot == nil &&
+		rd.HardState == nil &&
 		len(rd.Entries) == 0 &&
 		len(rd.Messages) == 0 &&
 		len(rd.CommittedEntries) == 0
@@ -299,6 +355,11 @@ type Status struct {
 	LastLogTerm  Term
 	StableIndex  Index
 
+	// SnapshotIndex and SnapshotTerm are the last entry folded into this
+	// node's snapshot. The log holds only what comes after SnapshotIndex.
+	SnapshotIndex Index
+	SnapshotTerm  Term
+
 	// LogRevision increments on every log mutation, so an observer can detect
 	// change without copying the log.
 	LogRevision uint64
@@ -317,4 +378,19 @@ type Status struct {
 type Progress struct {
 	NextIndex  Index
 	MatchIndex Index
+
+	// PendingSnapshot is non-zero while the leader is transferring its
+	// snapshot to this follower: it is the index of the snapshot being sent.
+	// AppendEntries are withheld for the duration, because the follower has
+	// nothing they could attach to.
+	PendingSnapshot Index
+
+	// SnapshotOffset is how many bytes of that snapshot the follower has
+	// acknowledged, and so where the next chunk starts.
+	SnapshotOffset uint64
+
+	// SnapshotsSent counts InstallSnapshot chunks sent to this follower
+	// during this leadership. It makes "the follower caught up by snapshot"
+	// something a test can observe rather than infer.
+	SnapshotsSent uint64
 }

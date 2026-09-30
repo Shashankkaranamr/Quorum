@@ -65,13 +65,19 @@ same code. It is the foundation of the whole testing story.
 ### 3.2 The Ready ordering is a correctness requirement
 
 ```
+storage.SaveSnapshot(rd.Snapshot)   // only if one was received; durable on return
 storage.Append(rd.Entries)
 storage.SetHardState(rd.HardState)
 storage.Sync()                      // <- exactly one fsync per Ready batch
 transport.Send(rd.Messages)         // never before Sync() returns
+sm.Restore(rd.Snapshot)             // only if one was received
 sm.Apply(rd.CommittedEntries)       // never before Sync() returns
 n.Advance()
 ```
+
+A received snapshot is a durable promise too: the follower's acknowledgement
+says "I hold everything up to its index". Its extra fsyncs (file and pointer)
+are counted separately, in `WALStats.SnapshotFsyncs`.
 
 **No message may leave the process before `Sync()` returns.** A granted vote and
 an accepted `AppendEntries` are durable promises; sending one before it is on
@@ -208,6 +214,19 @@ Things that will waste a cycle if you do not know them:
   PLAN.md, PROGRESS.md and CLAUDE.md.
 - **Large multi-heredoc Bash commands have failed to parse in this
   environment.** For prose-heavy files, use the Write tool instead of `cat <<EOF`.
+  The same goes for inline `python - <<EOF` edit scripts containing quotes or
+  backticks: write the script to the scratchpad and run the file.
+- **Python's text mode on Windows writes CRLF.** A script that rewrites a `.go`
+  file with plain `open(p, 'w')` turns every line into a diff. Pass
+  `newline=''`. The Go sources are LF. BUGS.md, DESIGN.md, PLAN.md and
+  PROGRESS.md are CRLF in the index; keep them that way.
+- **A WAL's snapshot directory defaults to a sibling of its log directory**
+  (`<dir>/../snap`). A test that uses `t.TempDir()` itself as the log directory
+  shares that sibling with every other temp dir in the test. Once snapshots are
+  involved, give each log its own parent (`filepath.Join(t.TempDir(), "wal")`)
+  or set `WALOptions.SnapDir`.
+- **`make proto-check` diffs against the git index**, so it fails on freshly
+  regenerated `gen/` until that is staged. Stage `gen/` and re-run it.
 - **`buf lint` exceptions are documented in `buf.yaml`.** They are naming
   conventions only; do not add more without writing down why.
 - **`data/` is gitignored runtime state** (WAL segments, snapshots). Never

@@ -27,16 +27,21 @@ func (n *Node) sendAppend(to NodeID) {
 		return
 	}
 
+	if last := n.log.lastIndex(); pr.NextIndex > last+1 {
+		// Only reachable when the leader's own log shrank under it, which a
+		// correct leader never does (MutationLeaderTruncatesOwnLog does).
+		// Clamping keeps the negative control running long enough for the
+		// checker to report the violation by name.
+		pr.NextIndex = last + 1
+	}
 	prevIndex := pr.NextIndex - 1
 	prevTerm, ok := n.log.term(prevIndex)
-	if !ok {
-		// The entry the follower needs has been compacted away. Phase 4 sends
-		// a snapshot here. Until snapshots exist this cannot happen, because
-		// nothing compacts; rewinding to the start of the log keeps the node
-		// correct if it ever does.
-		pr.NextIndex = n.log.firstIndex()
-		prevIndex = pr.NextIndex - 1
-		prevTerm, _ = n.log.term(prevIndex)
+	if !ok || pr.PendingSnapshot != 0 {
+		// The entry the follower needs next has been compacted away, so no
+		// AppendEntries can attach to its log: only the snapshot can bring it
+		// forward. The same holds while a transfer is already under way.
+		n.sendSnapshot(to, pr)
+		return
 	}
 
 	ents := n.log.slice(pr.NextIndex, pr.NextIndex+Index(n.cfg.MaxEntriesPerAppend))
@@ -49,6 +54,127 @@ func (n *Node) sendAppend(to NodeID) {
 		Entries:      ents,
 		LeaderCommit: n.log.committed,
 	})
+}
+
+// sendSnapshot sends a follower the next chunk of the leader's snapshot.
+//
+// The transfer is stop-and-wait: one chunk in flight, each acknowledged with
+// the byte count the follower now holds, and the next chunk starting exactly
+// there. A lost chunk or acknowledgement is recovered by the heartbeat, which
+// resends the current chunk. If the leader compacts again mid-transfer, the
+// next chunk belongs to the new snapshot and starts from zero; the follower
+// discards the partial old one, because the two can never be spliced.
+func (n *Node) sendSnapshot(to NodeID, pr *Progress) {
+	snap := n.snapshot
+	if snap.IsEmpty() {
+		// Unreachable: an entry can only be missing below the compaction
+		// point, and compacting is what produces a snapshot.
+		panic(fmt.Sprintf("raft: node %d must send node %d a snapshot but holds none (log starts at %d)",
+			n.id, to, n.log.firstIndex()))
+	}
+	if pr.PendingSnapshot != snap.Meta.Index {
+		pr.PendingSnapshot = snap.Meta.Index
+		pr.SnapshotOffset = 0
+	}
+
+	off := min(pr.SnapshotOffset, uint64(len(snap.Data)))
+	end := min(off+uint64(n.cfg.chunkBytes()), uint64(len(snap.Data)))
+	pr.SnapshotsSent++
+	n.send(Message{
+		Type:           MsgInstallSnapshot,
+		To:             to,
+		SnapshotMeta:   snap.Meta,
+		SnapshotOffset: off,
+		SnapshotData:   snap.Data[off:end],
+		SnapshotDone:   end == uint64(len(snap.Data)),
+	})
+}
+
+// handleInstallSnapshot is the follower side of snapshot transfer (§7).
+//
+// As with AppendEntries, Step has already applied the term rule, so m.Term
+// equals ours and the sender is this term's leader.
+func (n *Node) handleInstallSnapshot(m Message) {
+	if n.role == Candidate {
+		n.becomeFollower(m.Term, m.From)
+	}
+	if n.role == Leader {
+		panic(SafetyViolation{
+			Property: PropertyElectionSafety,
+			Detail: fmt.Sprintf("node %d is leader of term %d but node %d sent InstallSnapshot for it",
+				n.id, n.term, m.From),
+		})
+	}
+	n.lead = m.From
+	n.resetElectionTimer()
+
+	meta := m.SnapshotMeta
+	if meta.Index <= n.log.committed {
+		// We already hold everything this snapshot covers: it is stale,
+		// perhaps a retransmission that crossed our acknowledgement.
+		// Installing it would move the node backwards. Report the commit
+		// index instead -- every committed entry is in the leader's log
+		// (Leader Completeness), so that much certainly matches -- and let
+		// ordinary replication continue from there.
+		n.incoming = incomingSnapshot{}
+		n.send(Message{Type: MsgAppendEntriesResp, To: m.From, Success: true, MatchIndex: n.log.committed})
+		return
+	}
+
+	if n.incoming.meta != meta {
+		// A different snapshot from the one being assembled. Only its first
+		// chunk can start a new assembly.
+		n.incoming = incomingSnapshot{}
+		if m.SnapshotOffset != 0 {
+			n.send(Message{Type: MsgInstallSnapshotResp, To: m.From, SnapshotMeta: meta})
+			return
+		}
+		n.incoming.meta = meta
+	}
+	if have := uint64(len(n.incoming.data)); m.SnapshotOffset != have {
+		// A duplicate, or a chunk from beyond a gap. Either way, tell the
+		// leader where we actually are.
+		n.send(Message{Type: MsgInstallSnapshotResp, To: m.From, SnapshotMeta: meta, SnapshotBytesReceived: have})
+		return
+	}
+	n.incoming.data = append(n.incoming.data, m.SnapshotData...)
+	if !m.SnapshotDone {
+		n.send(Message{Type: MsgInstallSnapshotResp, To: m.From, SnapshotMeta: meta,
+			SnapshotBytesReceived: uint64(len(n.incoming.data))})
+		return
+	}
+
+	snap := Snapshot{Meta: meta, Data: n.incoming.data}
+	n.incoming = incomingSnapshot{}
+	n.log.restore(meta)
+	n.snapshot = snap
+	n.pendingSnapshot = &snap
+
+	// The acknowledgement is an AppendEntries success: from here on the
+	// follower's log agrees with the leader's up to the snapshot, and
+	// ordinary replication takes over. It is a durable promise like any
+	// other, and the Ready that carries it persists the snapshot first.
+	n.send(Message{Type: MsgAppendEntriesResp, To: m.From, Success: true, MatchIndex: meta.Index})
+}
+
+// handleInstallSnapshotResponse moves a snapshot transfer forward by one chunk.
+func (n *Node) handleInstallSnapshotResponse(m Message) {
+	if !n.isLeader() {
+		return
+	}
+	pr := n.progress[m.From]
+	if pr == nil || pr.PendingSnapshot == 0 || m.SnapshotMeta.Index != pr.PendingSnapshot {
+		// An acknowledgement for a transfer no longer running.
+		return
+	}
+	if m.SnapshotBytesReceived == pr.SnapshotOffset {
+		// A duplicate of an acknowledgement already acted on. Resending on
+		// it would double the traffic under duplication for nothing; the
+		// heartbeat covers a genuinely lost chunk.
+		return
+	}
+	pr.SnapshotOffset = m.SnapshotBytesReceived
+	n.sendSnapshot(m.From, pr)
 }
 
 // handleAppendEntries is the follower side of replication (§5.3).
@@ -79,6 +205,18 @@ func (n *Node) handleAppendEntries(m Message) {
 	// does not mean the sender is not the leader, and treating it as such
 	// would make a lagging follower campaign and disrupt a healthy cluster.
 	n.resetElectionTimer()
+
+	if m.PrevLogIndex < n.log.snapIndex {
+		// The leader is attaching below our snapshot: it has not yet heard
+		// that we installed one, or we compacted past where it thinks we
+		// are. Those entries are committed, so they match by Leader
+		// Completeness, but we no longer have them to compare. Report our
+		// commit index so the leader resumes from there. Rejecting instead
+		// would hand it a conflict hint above its nextIndex, which it rightly
+		// refuses to move forward on, and the two would stall.
+		n.send(Message{Type: MsgAppendEntriesResp, To: m.From, Success: true, MatchIndex: n.log.committed})
+		return
+	}
 
 	if !n.log.matchTerm(m.PrevLogIndex, m.PrevLogTerm) {
 		ci, ct := n.log.conflictHint(m.PrevLogIndex)
@@ -147,6 +285,21 @@ func (n *Node) handleAppendEntriesResponse(m Message) {
 	}
 
 	if m.Success {
+		if pr.PendingSnapshot != 0 && m.MatchIndex >= n.log.snapIndex {
+			// The follower now holds everything up to our compaction point
+			// -- it installed the snapshot, or caught up some other way -- so
+			// AppendEntries can attach again. Send what follows at once
+			// rather than waiting out a heartbeat.
+			pr.PendingSnapshot, pr.SnapshotOffset = 0, 0
+			pr.MatchIndex = max(pr.MatchIndex, m.MatchIndex)
+			pr.NextIndex = pr.MatchIndex + 1
+			if n.maybeCommit() {
+				n.broadcastAppend()
+			} else {
+				n.sendAppend(m.From)
+			}
+			return
+		}
 		// A response can arrive out of order, so only ever move forward.
 		if m.MatchIndex > pr.MatchIndex {
 			pr.MatchIndex = m.MatchIndex
@@ -157,6 +310,12 @@ func (n *Node) handleAppendEntriesResponse(m Message) {
 				n.broadcastAppend()
 			}
 		}
+		return
+	}
+
+	if pr.PendingSnapshot != 0 {
+		// A rejection of an AppendEntries sent before the transfer began.
+		// The transfer supersedes it.
 		return
 	}
 

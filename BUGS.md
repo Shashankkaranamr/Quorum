@@ -54,6 +54,143 @@ Optional. Whether this was a slip or a sign the design was wrong somewhere.
 
 ---
 
+## 2026-09-30 — A refused recovery kept the log's tail segment open
+
+**Phase:** 4 (the defect dates from phase 3)
+**Severity:** operational
+
+**Symptom observed.**
+The first run of `TestWALRefusesAMissingOrDamagedSnapshot` passed its
+assertions and then failed in cleanup, on both subtests:
+
+```
+TempDir RemoveAll cleanup: unlinkat ...\wal\000005.log: The process cannot
+access the file because it is being used by another process.
+```
+
+The test had already checked that `OpenWAL` refused to start, and it held no
+handle of its own.
+
+**Root cause.**
+Recovery opens the last segment for appending (`openTail`) as it reaches it,
+because that is where it truncates a torn tail. Some of its checks run after
+that point: the commit index against the last recovered entry (phase 3), and
+now the snapshot file a pointer names. When one of those refused, `OpenWAL`
+returned the error and dropped the `WAL` — with the tail segment's file still
+open. On Windows an open file cannot be deleted, so the leaked handle pinned the
+directory. It is the directory an operator would want to move aside to
+investigate a node that refused to start.
+
+The phase 3 path had the same leak. No test reached it, because nothing
+produced a recovered commit index beyond the log except deliberate damage, and
+the damage tests all failed before reaching the tail.
+
+**Fix.**
+`OpenWAL` closes the tail segment if recovery fails after opening it
+(`internal/storage/wal.go`).
+
+**Regression test.**
+`TestRefusedRecoveryReleasesTheLog` makes recovery refuse after the tail is
+open, then deletes the log directory. Against the pre-fix code it fails with
+`the refused log still holds a file open`; this was run and observed. The check
+depends on the platform: it catches the leak only where an open file cannot be
+deleted, which includes Windows, the development platform. Elsewhere it passes
+either way, and says so in its comment.
+
+**What it says about the design.**
+Opening the tail inside the recovery loop keeps recovery to a single pass, and
+that is still the right call. What was missing was treating "recovery has side
+effects" as something that needs cleanup on every exit path. It was caught by
+accident, and only because Windows is stricter about open files.
+
+---
+
+## 2026-09-30 — The snapshot-restore check could not detect lost data
+
+**Phase:** 4
+**Severity:** correctness of tests
+
+**Symptom observed.**
+`TestRestoreCheckCatchesALossyRestore` failed on its first run with `An error
+is expected but got nil`. It is the negative control for
+`TestSnapshotRestoreIsIdentical`. It restores every snapshot with its last key
+removed, and requires the hash comparison to notice. The comparison did not
+notice.
+
+**Root cause.**
+The scenario wrote 45 values across 13 keys, compacted at index 30 and left a
+17-entry log tail. The tail rewrote every one of the 13 keys. So a restore that
+lost a key had it put back by the replay, and by the time the hashes were
+compared the damage was gone. The positive test was passing, but it could not
+have failed for the class of bug it exists to catch: a snapshot that silently
+drops data.
+
+**Fix.**
+The first 25 writes now go to keys that are never written again, so they exist
+only in the snapshot, and the tail churns a separate set of keys. A comment at
+the workload says why its shape matters.
+
+**Regression test.**
+The negative control itself. Against the old workload it passes vacuously, as
+observed above. Against the new one it catches the lossy restore with differing
+hashes (`57be9591... before the restart, 9b34d9be... after`), and
+`TestSnapshotRestoreIsIdentical` still passes.
+
+**What it says about the design.**
+Nothing about snapshots, which were correct. It is the same lesson as the
+phase 2 reconvergence entry, and the reason every check here gets a negative
+control: the workload a check runs against decides what it can see. This one
+could only see damage that nothing afterwards overwrote.
+
+---
+
+## 2026-09-30 — Snapshot sending treated "entry missing" as "entry compacted"
+
+**Phase:** 4
+**Severity:** correctness of tests
+
+**Symptom observed.**
+The first full test run after adding snapshot transfer panicked in
+`TestMutatedRaftTripsInvariant`:
+
+```
+raft: node 4 must send node 2 a snapshot but holds none (log starts at 1)
+```
+
+No test involving snapshots had failed. The panic came from the phase 2
+negative controls.
+
+**Root cause.**
+`sendAppend` decided to send a snapshot whenever the log could not report a term
+for `prevLogIndex`. There are two reasons that can happen. One is that the
+entry is below the snapshot, which is what the new code meant. The other is
+that the entry is past the end of the log. In correct Raft a leader's nextIndex
+never passes its own last index plus one. `MutationLeaderTruncatesOwnLog` makes
+a leader drop its own entries, so nextIndex ends up past the end. The phase 2
+code had quietly rewound in that case; the new code sent a snapshot the node
+did not have.
+
+This affects only a deliberately broken leader. But if the control had died on
+a panic instead of reporting `LeaderAppendOnly`, the proof that that checker has
+teeth would have gone with it.
+
+**Fix.**
+`sendAppend` clamps nextIndex to the end of the log before looking up the
+previous term, so "missing" can only mean "compacted"
+(`raft/replication.go`).
+
+**Regression test.**
+`TestMutatedRaftTripsInvariant/a_leader_truncating_its_own_log_breaks_Leader_Append-Only`,
+which panicked before the fix and now reports `LeaderAppendOnly` as it did in phase 2.
+
+**What it says about the design.**
+One `ok == false` covered two conditions with different remedies. The negative
+controls found it because they are the only tests that build states correct
+Raft never reaches. That is a reason to keep them running with every other test
+rather than behind a build tag (DESIGN.md §10, phase 2).
+
+---
+
 ## 2026-09-27 — The durability audit flagged a correct Ready that spanned two terms
 
 **Phase:** 3
@@ -243,4 +380,20 @@ found" stays visible.*
   claim about what the tests found, and it is only worth anything because each
   check was separately shown to fail on a deliberately broken input: three
   broken decoders, a recovery with its truncation removed, storage that forgets
-  its vote, and storage that loses a committed entry.
+  its vote, and storage that loses a committed entry. *Addendum, phase 4:*
+  recovery did turn out to have one defect, but an operational one, not a
+  correctness one. It leaked a file handle when it refused to start
+  (2026-09-30, above). It never recovered a wrong state.
+
+- **A snapshot or compaction bug in the consensus code during phase 4.** None
+  found. With compaction every 15 entries and snapshots sent in 16-byte chunks,
+  the randomized trials took about 1,600 snapshots and installed 277 from a
+  leader, through loss, duplication, partitions and crashes, in memory and on
+  disk. Every invariant was checked after every tick, including the new
+  SnapshotFidelity check, which compares every replica's state-machine hash at
+  every index. The durability audit checked about 137,000 messages across
+  about 2,200 snapshot saves. All three bugs found this phase were in tests or
+  error handling. As in earlier phases, this is only evidence because each new
+  check was shown to fail on a deliberately broken input: a corrupting restore,
+  a lossy restore, a snapshot without sessions, an acknowledgement sent before
+  its snapshot was durable, and segments deleted before their pointer.

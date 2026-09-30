@@ -190,3 +190,79 @@ func TestCheckerAcceptsAHealthyHistory(t *testing.T) {
 	require.Equal(t, raft.NodeID(1), id)
 	require.Equal(t, 1, c.TermsWithLeaders())
 }
+
+// compacted is a view of a node that has folded everything up to snap into a
+// snapshot: its log holds only what follows.
+func compacted(id raft.NodeID, role raft.Role, term raft.Term, commit raft.Index, snap raft.Entry, entries ...raft.Entry) testutil.NodeView {
+	v := view(id, role, term, commit, entries...)
+	v.Status.SnapshotIndex, v.Status.SnapshotTerm = snap.Index, snap.Term
+	if len(entries) == 0 {
+		v.Status.LastLogIndex, v.Status.LastLogTerm = snap.Index, snap.Term
+	}
+	v.Status.LogRevision += uint64(snap.Index) * 1_000_000
+	return v
+}
+
+// TestCheckerHandlesCompactedLogs covers what compaction changed. Logs now
+// start at different indices, so every check that compared logs position by
+// position had to learn to compare index by index. Each case here either must
+// still be caught with the logs offset, or is healthy compaction that must not
+// be mistaken for a violation.
+func TestCheckerHandlesCompactedLogs(t *testing.T) {
+	t.Run("LogMatching: divergence between logs that start at different indices", func(t *testing.T) {
+		c := testutil.NewChecker()
+		observe(c, 1,
+			compacted(1, raft.Follower, 3, 3, e(3, 1), e(4, 1), e(5, 2), e(6, 3)),
+			view(2, raft.Follower, 3, 3, e(1, 1), e(2, 1), e(3, 1), e(4, 1), e(5, 3), e(6, 3)),
+		)
+		require.True(t, c.Violated(testutil.LogMatching), "%v", c.Violations())
+	})
+
+	t.Run("LeaderAppendOnly: an entry above the snapshot disappears", func(t *testing.T) {
+		c := testutil.NewChecker()
+		observe(c, 1, view(1, raft.Leader, 2, 3, e(1, 2), e(2, 2), e(3, 2), e(4, 2), e(5, 2)))
+		observe(c, 2, compacted(1, raft.Leader, 2, 3, e(3, 2), e(4, 2)))
+		require.True(t, c.Violated(testutil.LeaderAppendOnly), "%v", c.Violations())
+	})
+
+	t.Run("WellFormed: compacted past what was applied", func(t *testing.T) {
+		c := testutil.NewChecker()
+		v := compacted(1, raft.Follower, 1, 5, e(4, 1), e(5, 1))
+		v.Status.LastApplied = 3
+		observe(c, 1, v)
+		require.True(t, c.Violated(testutil.WellFormed), "%v", c.Violations())
+	})
+
+	t.Run("SnapshotFidelity: two states at one index", func(t *testing.T) {
+		c := testutil.NewChecker()
+		c.RecordStateHash(1, 1, 7, [32]byte{1}, "applying")
+		c.RecordStateHash(2, 2, 7, [32]byte{2}, "restoring a snapshot")
+		require.True(t, c.Violated(testutil.SnapshotFidelity), "%v", c.Violations())
+	})
+
+	t.Run("healthy: leader compacts, followers start at other indices", func(t *testing.T) {
+		c := testutil.NewChecker()
+		full := []raft.Entry{e(1, 1), e(2, 1), e(3, 2), e(4, 2), e(5, 2)}
+		observe(c, 1,
+			view(1, raft.Leader, 2, 5, full...),
+			view(2, raft.Follower, 2, 5, full...),
+			compacted(3, raft.Follower, 2, 5, e(2, 1), full[2:]...),
+		)
+		// The leader folds its first three entries away: its log shrinks from
+		// the front, which is compaction, not a violation of Append-Only.
+		observe(c, 2,
+			compacted(1, raft.Leader, 2, 5, e(3, 2), full[3:]...),
+			view(2, raft.Follower, 2, 5, full...),
+			compacted(3, raft.Follower, 2, 5, e(2, 1), full[2:]...),
+		)
+		// A new leader in a later term whose snapshot covers entries
+		// committed in term 2: Leader Completeness must accept the snapshot
+		// as holding them.
+		observe(c, 3, compacted(3, raft.Leader, 3, 5, e(4, 2), e(5, 2)))
+		for i := raft.Index(1); i <= 5; i++ {
+			c.RecordStateHash(3, 1, i, [32]byte{byte(i)}, "applying")
+		}
+		c.RecordStateHash(3, 3, 4, [32]byte{4}, "restoring a snapshot")
+		require.NoError(t, c.Err(), "healthy compaction was flagged")
+	})
+}

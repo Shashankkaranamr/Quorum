@@ -19,13 +19,17 @@ write it has already been told succeeded, even if the leader that accepted it
 later dies. This is the same underlying problem etcd solves for Kubernetes'
 cluster state.
 
-> **Status: phase 3 of 8 — Raft elects, replicates and survives restarts.**
+> **Status: phase 4 of 8 — Raft elects, replicates, survives restarts and
+> compacts its log.**
 >
 > The consensus core runs in a deterministic simulator that checks Raft's
-> safety properties after every simulated tick, and each node persists to a
-> write-ahead log that recovers cleanly from a crash at any byte. There is
-> **no network service yet**: no gRPC, no client API, no separate processes.
-> Those are phase 5. The design is in [DESIGN.md](DESIGN.md), the roadmap and
+> safety properties after every simulated tick. Each node persists to a
+> write-ahead log that recovers cleanly from a crash at any byte. It snapshots
+> its state machine, the key-value store and its client session table, and
+> deletes the log the snapshot supersedes. A node that falls far behind, or
+> loses its data directory, is caught up by snapshot transfer. There is **no
+> network service yet**: no gRPC, no client API, no separate processes. Those
+> are phase 5. The design is in [DESIGN.md](DESIGN.md), the roadmap and
 > acceptance criteria in [PLAN.md](PLAN.md), and what is actually verified in
 > [PROGRESS.md](PROGRESS.md).
 

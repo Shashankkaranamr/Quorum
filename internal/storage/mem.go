@@ -1,14 +1,18 @@
 package storage
 
-import "github.com/Shashankkaranamr/Quorum/raft"
+import (
+	"fmt"
+
+	"github.com/Shashankkaranamr/Quorum/raft"
+)
 
 // MemStorage is an in-memory Storage for the deterministic simulator.
 //
 // It is not a stub. It models the one thing about real storage that matters to
 // correctness: Append and SetHardState buffer, and only Sync publishes. So a
 // node that "crashes" before Sync loses exactly what a real node would lose.
-// Batches are applied by the same function the write-ahead log's recovery
-// uses, so the two cannot disagree about what a batch means.
+// Batches and snapshots are applied by the same code the write-ahead log uses,
+// so the two cannot disagree about what either means.
 //
 // The cost of an fsync is modelled by the simulator rather than here
 // (testutil.Options.SyncCostTicks), so it applies equally to the real
@@ -18,9 +22,9 @@ import "github.com/Shashankkaranamr/Quorum/raft"
 // the node.
 type MemStorage struct {
 	// durable state
-	hs      raft.HardState
-	entries []raft.Entry
-	applied raft.Index
+	hs   raft.HardState
+	log  logState
+	snap raft.Snapshot
 
 	// buffered, not yet durable
 	pendingEntries []raft.Entry
@@ -30,6 +34,7 @@ type MemStorage struct {
 	SyncCount      uint64
 	AppendCount    uint64
 	EntriesWritten uint64
+	SnapshotsSaved uint64
 }
 
 var _ Storage = (*MemStorage)(nil)
@@ -59,11 +64,9 @@ func (m *MemStorage) SetHardState(hs raft.HardState) error {
 func (m *MemStorage) Sync() error {
 	m.SyncCount++
 
-	entries, err := appendEntries(m.entries, m.pendingEntries)
-	if err != nil {
+	if err := m.log.append(m.pendingEntries); err != nil {
 		return err
 	}
-	m.entries = entries
 	m.pendingEntries = m.pendingEntries[:0]
 
 	if m.pendingHS != nil {
@@ -73,25 +76,42 @@ func (m *MemStorage) Sync() error {
 	return nil
 }
 
-// InitialState implements Storage.
-func (m *MemStorage) InitialState() (raft.HardState, []raft.Entry, raft.Index, error) {
-	return m.hs, append([]raft.Entry(nil), m.entries...), m.applied, nil
+// SaveSnapshot implements Storage.
+func (m *MemStorage) SaveSnapshot(snap raft.Snapshot) error {
+	if len(m.pendingEntries) > 0 || m.pendingHS != nil {
+		return errUnsyncedSnapshot
+	}
+	if snap.Meta.Index <= m.log.snap.Index {
+		return fmt.Errorf("storage: snapshot at %d is not newer than the current one at %d",
+			snap.Meta.Index, m.log.snap.Index)
+	}
+	m.log.applySnapshot(snap.Meta)
+	m.snap = raft.Snapshot{Meta: snap.Meta, Data: append([]byte(nil), snap.Data...)}
+	m.SnapshotsSaved++
+	return nil
 }
 
-// SetApplied records how far the state machine has been applied. Phase 4 uses
-// this to decide when to snapshot.
-func (m *MemStorage) SetApplied(i raft.Index) { m.applied = i }
+// InitialState implements Storage.
+func (m *MemStorage) InitialState() (Recovered, error) {
+	return Recovered{
+		HardState: m.hs,
+		Snapshot:  m.snap,
+		Entries:   m.log.clone().entries,
+	}, nil
+}
 
-// DurableEntries returns the entries that survived the last Sync.
+// DurableEntries returns the entries after the snapshot that survived the last
+// Sync.
 //
 // This is what a crash test reads: everything appended but not yet synced is
 // gone, exactly as it would be on a real node.
-func (m *MemStorage) DurableEntries() []raft.Entry {
-	return append([]raft.Entry(nil), m.entries...)
-}
+func (m *MemStorage) DurableEntries() []raft.Entry { return m.log.clone().entries }
 
 // DurableHardState returns the hard state that survived the last Sync.
 func (m *MemStorage) DurableHardState() raft.HardState { return m.hs }
+
+// DurableSnapshot returns the snapshot that survived, if any.
+func (m *MemStorage) DurableSnapshot() raft.Snapshot { return m.snap }
 
 // PendingCount is how much is buffered but not durable. A crash loses exactly
 // this much.
@@ -106,4 +126,10 @@ func (m *MemStorage) Crash() error {
 	m.pendingEntries = m.pendingEntries[:0]
 	m.pendingHS = nil
 	return nil
+}
+
+// Wipe destroys everything, durable or not, as deleting a node's data
+// directory would. The node comes back as if it had never run.
+func (m *MemStorage) Wipe() {
+	*m = MemStorage{}
 }

@@ -49,9 +49,9 @@ const (
 	// state.
 	recordEntryBatch recordType = 1
 
-	// recordSnapshotPointer carries a WalSnapshotPointer. The codec handles it
-	// because the format was fixed in phase 1; recovery refuses it until phase
-	// 4 gives it a meaning.
+	// recordSnapshotPointer carries a WalSnapshotPointer: it names a durable
+	// snapshot file and carries the log tail and hard state, and it is always
+	// the first record of its segment. Recovery starts from the last one.
 	recordSnapshotPointer recordType = 2
 )
 
@@ -94,6 +94,10 @@ var (
 )
 
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+// crc is the CRC32C of b. Snapshot files are checked with it against the
+// pointer that names them.
+func crc(b []byte) uint32 { return crc32.Checksum(b, castagnoli) }
 
 // encodeRecord appends the framed record to dst.
 func encodeRecord(dst []byte, r record) ([]byte, error) {

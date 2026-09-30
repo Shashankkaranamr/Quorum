@@ -166,10 +166,19 @@ message InstallSnapshot {
   bool done = 4;
 }
 
+// InstallSnapshotResponse acknowledges a chunk that did not complete the
+// transfer. The final chunk is acknowledged with an AppendEntriesResponse
+// instead: once the snapshot is installed the follower's log agrees with the
+// leader's up to its last included index, and ordinary replication resumes.
 message InstallSnapshotResponse {
   // bytes_received lets the leader resume a transfer interrupted mid-stream
   // rather than restarting it.
   uint64 bytes_received = 1;
+
+  // metadata names the snapshot bytes_received refers to. Without it, an
+  // acknowledgement delayed past the leader's next compaction would be read
+  // as progress on the newer snapshot.
+  SnapshotMetadata metadata = 2;
 }
 
 // ---------------------------------------------------------------------------
@@ -208,11 +217,27 @@ message WalEntryBatch {
 // names has itself been written and fsynced. That ordering is what makes a
 // crash mid-snapshot recoverable: a pointer always names a complete file, and
 // a complete file with no pointer is simply ignored and overwritten later.
+//
+// A pointer is always the FIRST record of a fresh segment, and it carries
+// everything the node still needs from before it: the log entries after the
+// snapshot and the current hard state. Recovery therefore starts at the last
+// segment that begins with a pointer and never needs to read anything older,
+// so the older segments can be deleted in any order -- and a crash part-way
+// through deleting them leaves nothing recovery has to make sense of. As with
+// WalEntryBatch, putting it all in one record under one CRC means a torn write
+// loses the pointer whole or not at all.
 message WalSnapshotPointer {
   SnapshotMetadata metadata = 1;
   string filename = 2;
   uint32 crc32c = 3;
   uint64 size_bytes = 4;
+
+  // The hard state as of the snapshot. Absent only if none was ever written.
+  HardState hard_state = 5;
+
+  // The log entries after metadata.last_included_index that the node still
+  // holds, in order.
+  repeated Entry entries = 6;
 }
 
 // ---------------------------------------------------------------------------

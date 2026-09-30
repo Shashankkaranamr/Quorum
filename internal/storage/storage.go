@@ -1,6 +1,10 @@
 package storage
 
-import "github.com/Shashankkaranamr/Quorum/raft"
+import (
+	"errors"
+
+	"github.com/Shashankkaranamr/Quorum/raft"
+)
 
 // Storage is the durability boundary.
 //
@@ -11,6 +15,7 @@ import "github.com/Shashankkaranamr/Quorum/raft"
 //
 // The contract the driver relies on:
 //
+//	SaveSnapshot(snap)    // durable when it returns
 //	Append(entries)       // buffered, not durable
 //	SetHardState(hs)      // buffered, not durable
 //	Sync()                // everything buffered is now durable
@@ -34,8 +39,36 @@ type Storage interface {
 	// Sync makes everything buffered durable. This is the fsync.
 	Sync() error
 
-	// InitialState returns what recovery found: the persisted hard state, the
-	// log, and how far the state machine had been applied. Phase 3 reads this
-	// from the write-ahead log; phase 2 reads it from memory.
-	InitialState() (raft.HardState, []raft.Entry, raft.Index, error)
+	// SaveSnapshot makes snap durable and folds the log into it: entries at
+	// or below its index are dropped, and those after it are kept only if
+	// the log holds the snapshot's own last entry (raft's Figure 13 rule).
+	//
+	// Unlike Append it does not buffer. It is called with nothing buffered --
+	// either between Readies, for a snapshot the node took itself, or first
+	// thing in a Ready that installs one from the leader -- and it is durable
+	// when it returns. A snapshot at or below the current one is refused:
+	// rewriting the file a durable pointer names is how a crash would turn a
+	// good snapshot into a torn one.
+	SaveSnapshot(snap raft.Snapshot) error
+
+	// InitialState returns what recovery found.
+	InitialState() (Recovered, error)
 }
+
+// Recovered is a node's durable state as found at startup: everything needed
+// to rebuild it.
+//
+// The state machine is restored from Snapshot, and the log continues from
+// there with Entries. Snapshot is empty when nothing has been compacted.
+type Recovered struct {
+	HardState raft.HardState
+	Snapshot  raft.Snapshot
+	Entries   []raft.Entry
+}
+
+// errUnsyncedSnapshot is returned when SaveSnapshot is called with writes
+// still buffered. Saving the snapshot first would make it durable ahead of
+// entries that were appended before it, which is an order the log cannot
+// express.
+var errUnsyncedSnapshot = errors.New("storage: SaveSnapshot called with unsynced writes buffered; " +
+	"Sync them first")

@@ -16,14 +16,14 @@ a later phase is started before that.
 > we actually are** — what is built, what is verified, and what the next concrete
 > steps are. Check it before starting work.
 
-**Current status: phase 3 complete.**
+**Current status: phase 4 complete.**
 
 | Phase | Title | Status |
 |---|---|---|
 | 1 | Foundations and design | ✅ complete |
 | 2 | Core consensus: election and log replication | ✅ complete |
 | 3 | Crash-safe persistence | ✅ complete |
-| 4 | Snapshotting and log compaction | not started |
+| 4 | Snapshotting and log compaction | ✅ complete |
 | 5 | gRPC KV service, linearizable reads, deduplication | not started |
 | 6 | Fault-injection suite and bug log | not started |
 | 7 | Live cluster visualizer | not started |
@@ -215,7 +215,7 @@ messages, which is phase 5's gRPC transport.
 
 ---
 
-## Phase 4 — Snapshotting and log compaction
+## Phase 4 — Snapshotting and log compaction ✅
 
 **Goal.** History is compacted so a lagging or rejoining node catches up quickly
 instead of replaying everything.
@@ -224,28 +224,101 @@ instead of replaying everything.
 handling; WAL segment reclamation; state machine snapshot/restore including the
 session table.
 
+**Delivered.** In the core: `Node.Compact`, chunked `InstallSnapshot` with
+resumable, stop-and-wait transfer, and Figure 13's install rule (`raft/`). In
+storage: `SaveSnapshot` on both the WAL and `MemStorage`; recovery that starts
+from the last snapshot pointer; reclamation of superseded segments and
+snapshot files (`internal/storage/`). In the driver: compaction at a threshold,
+and snapshot installation as step 0 of the Ready (`internal/server/`). The
+replicated key-value store with its session table and a deterministic snapshot
+encoding (`internal/statemachine/`). A new invariant, SnapshotFidelity, in the
+simulator. Format additions and design decisions are in DESIGN.md §10, phase 4.
+
 **Acceptance criteria**
 
-1. **Snapshots fire and reclaim space.** `TestSnapshotAtThreshold`: crossing
-   `snapshot_threshold_entries` produces a snapshot file and **deletes** the WAL
-   segments it supersedes.
-2. **Restore is exact.** `TestSnapshotRestoreIsIdentical`: restarting from
-   snapshot plus WAL tail produces a state machine whose hash is identical to
-   the one that was running before the restart.
-3. **A lagging follower really uses InstallSnapshot.** `TestFarBehindFollowerGetsSnapshot`:
-   advance the leader past the follower's compacted next index, and assert the
-   `InstallSnapshot` message type was actually sent — not merely that the
-   follower eventually converged.
-4. **Deduplication survives compaction.** `TestSessionsSurviveSnapshot`: take a
-   snapshot, restart from it, replay a duplicate `(client_id, seq)`, and require
-   it to be deduplicated with `duplicate = true`.
-5. **A crash mid-snapshot is recoverable.** `TestCrashDuringSnapshot`: crash
-   between writing the `.snap` file and committing the `WalSnapshotPointer`, and
-   between the pointer and segment deletion. Both must recover to a consistent
-   state.
-6. **A wiped node rejoins.** `TestWipedNodeCatchesUp`: delete a node's data
-   directory entirely, restart it, and require it to catch up via snapshot
-   transfer and match the others.
+1. ✅ **Snapshots fire and reclaim space.** `TestSnapshotAtThreshold`, on real
+   WALs with 1 KiB segments. Below the threshold there is no snapshot file on
+   any node and segment `000001.log` still exists. After crossing it, each node
+   holds exactly one `.snap` file, named for its snapshot index, and
+   `000001.log` has been **deleted**, as `WALStats.SegmentsDeleted` confirms.
+2. ✅ **Restore is exact.** `TestSnapshotRestoreIsIdentical`. A key-value
+   history with a session table is compacted at index 30 with a 17-entry log
+   tail. Every node is crashed and restarted, isolated so nothing new commits,
+   and given one step to restore the snapshot and replay the tail. Its
+   state-machine hash, covering data and sessions, must equal the hash from
+   before the crash. The test also asserts each node really restored from its
+   snapshot rather than replaying from index 1. Negative control:
+   `TestRestoreCheckCatchesALossyRestore` drops one key on restore and must be
+   caught. Its first run was not caught, which exposed a weakness in the
+   workload (BUGS.md, 2026-09-30).
+3. ✅ **A lagging follower really uses InstallSnapshot.**
+   `TestFarBehindFollowerGetsSnapshot` isolates a follower until the leader has
+   compacted past its whole log, then heals. It counts `MsgInstallSnapshot`
+   messages actually **handed to the transport** addressed to that follower.
+   With 16-byte chunks there must be at least the three one snapshot needs. It
+   also checks the follower's driver installed one and its state machine was
+   restored, and that every node ends with the same state hash. It runs on a
+   clean network and on one with 10% loss, 10% duplication and reordering.
+   Negative control: `TestSnapshotCountIsZeroForANearbyFollower` requires the
+   count to stay at zero for a follower that is only a few entries behind.
+4. ✅ **Deduplication survives compaction.** `TestSessionsSurviveSnapshot`. A
+   client writes, and another client's traffic pushes the compaction point past
+   that write, so it survives only in the snapshot's session table. The whole
+   cluster restarts from snapshots. The client retries with the same
+   `(client_id, seq)`. Every node must return `duplicate = true` with the
+   original applied index and leave the value unchanged. Negative control:
+   `TestSessionCheckCatchesASessionlessSnapshot` leaves the session table out of
+   the snapshot, and the retry must be caught being applied as new.
+5. ✅ **A crash mid-snapshot is recoverable.** `TestCrashDuringSnapshot` crashes
+   the real WAL in five places:
+   - between the `.snap` file and the pointer;
+   - between the pointer and segment deletion;
+   - mid-way through the pointer write, leaving a torn record;
+   - part-way through deletion, leaving a gap;
+   - mid-way through the `.snap` file.
+
+   Each must recover to exactly the state before the snapshot or exactly the
+   state after it, depending only on whether the pointer was durable. Each must
+   remove what the crash left behind, and must accept a write that then
+   survives a second recovery. Negative control:
+   `TestSnapshotCrashCheckCatchesMisorderedWrites` builds the disk a snapshot
+   would leave if it deleted segments before its pointer was durable, and
+   requires the check to reject it.
+6. ✅ **A wiped node rejoins.** `TestWipedNodeCatchesUp` deletes a node's data
+   directory entirely, while it is down, on real disk. After restart it comes
+   back with an empty log and term 0. It must receive InstallSnapshot, persist
+   the snapshot, and end with exactly the leader's applied index and state hash.
+   Caveat, in the test and in DESIGN.md §10: a wiped node forgets its vote,
+   which this test does not claim is safe in general.
+
+**Also delivered beyond the original criteria**
+
+- `TestRandomizedTrialsUpholdSafetyWithSnapshots`: the phase 2 randomized
+  trials with compaction every 15 entries and 16-byte chunks, in memory and on
+  disk. In the full run about 1,600 snapshots were taken and 277 installed from
+  a leader, under loss, duplication, partitions and crashes. Every invariant,
+  SnapshotFidelity included, was checked after every tick.
+- The SnapshotFidelity invariant: every replica's state-machine hash, compared
+  at every applied index, whether the replica applied or restored its way
+  there. Negative control: `TestSnapshotFidelityCatchesACorruptTransfer`, a
+  restore that flips one bit.
+- `TestNoSendBeforeSync` now also runs with snapshots on: about 137,000
+  messages audited across about 2,200 snapshot saves. Negative control:
+  `TestDurabilityAuditCatchesAnEarlySnapshotAck`.
+- `TestWALAgreesWithMemStorageThroughSnapshots`: the phase 3 differential test,
+  extended with local snapshots, installed snapshots whose last entry the log
+  may not hold, and reopening from disk at random points.
+- `TestCheckerHandlesCompactedLogs`: the checkers compare logs by index now.
+  Hand-built violations in offset logs must still be caught, and healthy
+  compaction must not be flagged.
+- One real defect in recovery's error path, found and fixed with a regression
+  test (BUGS.md, 2026-09-30).
+
+**Not done, and why.** goleak is still deferred to phase 5, for the reason
+given under phase 3. The key-value **state machine** was built here because
+criterion 4 cannot be met without it. The **gRPC service** that proposes into
+it, and the client library, are phase 5. Snapshots are held in memory, not
+streamed from disk; see DESIGN.md §10.
 
 ---
 

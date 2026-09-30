@@ -69,6 +69,13 @@ type trialStats struct {
 	dropped     uint64
 	partitioned uint64
 	hadLeader   bool
+
+	// Snapshot activity among the nodes alive at the end. Counters reset when
+	// a node restarts, so these are lower bounds -- enough to show a trial
+	// with compaction switched on actually compacted and transferred.
+	snapshotsTaken     uint64
+	snapshotsInstalled uint64
+	restores           int
 }
 
 // runRandomizedTrial runs one seeded trial. configure, if given, adjusts the
@@ -158,20 +165,31 @@ func runRandomizedTrial(t *testing.T, n int, seed uint64, configure ...func(*tes
 	stats.dropped = c.Net.Stats.Dropped
 	stats.partitioned = c.Net.Stats.Partitioned
 	stats.committed = c.Checker.MaxCommitted
+	for _, id := range c.LiveIDs() {
+		m := c.Replicas[id].Driver.Metrics()
+		stats.snapshotsTaken += m.SnapshotsTaken
+		stats.snapshotsInstalled += m.SnapshotsInstalled
+		stats.restores += c.Replicas[id].SM.Restores
+	}
 
-	// After healing, every live node must agree on the committed prefix.
+	// After healing, every live node must agree on the committed prefix, over
+	// the part of it both the node and the leader still hold in their logs.
+	// What either has compacted is covered by SnapshotFidelity instead.
 	if lead, ok := c.Leader(); ok {
 		target := c.Status(lead).CommitIndex
-		want := c.Log(lead)
+		want := map[raft.Index]raft.Term{}
+		for _, e := range c.Log(lead) {
+			if e.Index <= target {
+				want[e.Index] = e.Term
+			}
+		}
 		for _, id := range c.LiveIDs() {
-			got := c.Log(id)
-			for i := range want {
-				if want[i].Index > target || i >= len(got) {
-					break
+			for _, e := range c.Log(id) {
+				if term, ok := want[e.Index]; ok {
+					require.Equalf(t, term, e.Term,
+						"seed %d: node %d disagrees with leader %d at index %d after healing\n%s",
+						seed, id, lead, e.Index, c)
 				}
-				require.Equalf(t, want[i].Term, got[i].Term,
-					"seed %d: node %d disagrees with leader %d at index %d after healing\n%s",
-					seed, id, lead, want[i].Index, c)
 			}
 		}
 	}

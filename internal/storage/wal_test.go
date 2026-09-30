@@ -16,22 +16,23 @@ import (
 // durableState is what recovery must reproduce.
 type durableState struct {
 	HS      raft.HardState
+	Snap    raft.SnapshotMeta
 	Entries []raft.Entry
 }
 
 func (s durableState) String() string {
-	return fmt.Sprintf("hs=%+v last=%d", s.HS, len(s.Entries))
+	return fmt.Sprintf("hs=%+v snap=%d@%d entries=%d", s.HS, s.Snap.Index, s.Snap.Term, len(s.Entries))
 }
 
 func stateOf(t *testing.T, s Storage) durableState {
 	t.Helper()
-	hs, ents, applied, err := s.InitialState()
+	rec, err := s.InitialState()
 	require.NoError(t, err)
-	require.Zero(t, applied, "nothing records an applied index until phase 4")
+	ents := rec.Entries
 	if len(ents) == 0 {
 		ents = nil
 	}
-	return durableState{HS: hs, Entries: ents}
+	return durableState{HS: rec.HardState, Snap: rec.Snapshot.Meta, Entries: ents}
 }
 
 // batch is one Ready's worth of durable writes.
@@ -337,8 +338,9 @@ func TestWALRefusesDamageThatIsNotATornTail(t *testing.T) {
 		path := filepath.Join(dir, segmentName(seqs[len(seqs)-1]))
 		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
 		require.NoError(t, err)
-		// A snapshot pointer is a record this binary cannot act on yet, and
-		// its CRC is valid, so it must not be mistaken for a torn tail.
+		// A snapshot pointer anywhere but the start of a segment is a record
+		// this code never writes -- SaveSnapshot always rolls first -- and its
+		// CRC is valid, so it must not be mistaken for a torn tail.
 		rec, err := encodeRecord(nil, sampleRecords()[4])
 		require.NoError(t, err)
 		_, err = f.Write(rec)
@@ -346,7 +348,7 @@ func TestWALRefusesDamageThatIsNotATornTail(t *testing.T) {
 		require.NoError(t, f.Close())
 
 		_, err = OpenWAL(dir, WALOptions{SegmentBytes: 128})
-		require.ErrorContains(t, err, "phase 4")
+		require.ErrorContains(t, err, "not the first record")
 	})
 }
 

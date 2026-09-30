@@ -96,6 +96,13 @@ func TestMessageRoundTrip(t *testing.T) {
 		{Type: raft.MsgAppendEntriesResp, From: 3, To: 1, Term: 4, Success: true, MatchIndex: 6},
 		{Type: raft.MsgAppendEntriesResp, From: 3, To: 1, Term: 4,
 			Success: false, ConflictIndex: 3, ConflictTerm: 1},
+		{Type: raft.MsgInstallSnapshot, From: 1, To: 3, Term: 4,
+			SnapshotMeta: raft.SnapshotMeta{Index: 90, Term: 3}, SnapshotOffset: 4096,
+			SnapshotData: []byte("chunk"), SnapshotDone: true},
+		{Type: raft.MsgInstallSnapshot, From: 1, To: 3, Term: 4,
+			SnapshotMeta: raft.SnapshotMeta{Index: 90, Term: 3}},
+		{Type: raft.MsgInstallSnapshotResp, From: 3, To: 1, Term: 4,
+			SnapshotMeta: raft.SnapshotMeta{Index: 90, Term: 3}, SnapshotBytesReceived: 8192},
 	} {
 		t.Run(m.Type.String()+"/"+m.String(), func(t *testing.T) {
 			p, err := pbconv.MessageToProto(m)
@@ -122,22 +129,16 @@ func TestMessageRoundTrip(t *testing.T) {
 			require.Equal(t, m.MatchIndex, got.MatchIndex)
 			require.Equal(t, m.ConflictTerm, got.ConflictTerm)
 			require.Equal(t, m.ConflictIndex, got.ConflictIndex)
+			require.Equal(t, m.SnapshotMeta, got.SnapshotMeta)
+			require.Equal(t, m.SnapshotOffset, got.SnapshotOffset)
+			require.Equal(t, string(m.SnapshotData), string(got.SnapshotData))
+			require.Equal(t, m.SnapshotDone, got.SnapshotDone)
+			require.Equal(t, m.SnapshotBytesReceived, got.SnapshotBytesReceived)
 			require.Equal(t, len(m.Entries), len(got.Entries))
 			for i := range m.Entries {
 				require.Equal(t, m.Entries[i], got.Entries[i])
 			}
 		})
-	}
-}
-
-// TestSnapshotMessagesAreRejectedUntilPhase4 keeps the unimplemented path loud.
-// A silent zero value here would be a message that converts to nothing and is
-// dropped without anyone noticing.
-func TestSnapshotMessagesAreRejectedUntilPhase4(t *testing.T) {
-	for _, typ := range []raft.MessageType{raft.MsgInstallSnapshot, raft.MsgInstallSnapshotResp} {
-		_, err := pbconv.MessageToProto(raft.Message{Type: typ, From: 1, To: 2, Term: 1})
-		require.Error(t, err)
-		require.Contains(t, err.Error(), "phase 4")
 	}
 }
 

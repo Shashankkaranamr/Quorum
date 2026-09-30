@@ -67,6 +67,21 @@ type Options struct {
 	HeartbeatTimeoutTicks   int
 	MaxEntriesPerAppend     int
 
+	// SnapshotThreshold turns on log compaction: each node snapshots once this
+	// many entries have been applied past its last snapshot. Zero never
+	// compacts, which is the default so that earlier phases' tests see the
+	// log they always did.
+	SnapshotThreshold uint64
+
+	// MaxSnapshotChunkBytes is raft.Config.MaxSnapshotChunkBytes. Tests set it
+	// small to force multi-chunk transfers.
+	MaxSnapshotChunkBytes int
+
+	// StateMachine builds a node's state machine, at start and on every
+	// restart. Nil means a Digest, whose state is a hash of everything
+	// applied.
+	StateMachine func(id raft.NodeID) server.StateMachine
+
 	// SyncCostTicks makes a node's fsync take logical ticks, which is how the
 	// simulator reproduces the head-of-line-blocking hazard: the driver cannot
 	// process ticks while storage is busy, so tick lag becomes non-zero.
@@ -122,27 +137,6 @@ type Replica struct {
 
 // Node returns the underlying core.
 func (r *Replica) Node() *raft.Node { return r.Driver.Node() }
-
-// Recorder is a StateMachine that records what was applied, and reports every
-// application to the checker so State Machine Safety can be verified.
-type Recorder struct {
-	id      raft.NodeID
-	cluster *Cluster
-	Applied []raft.Entry
-}
-
-// Apply implements server.StateMachine.
-func (r *Recorder) Apply(entries []raft.Entry) error {
-	for _, e := range entries {
-		if n := len(r.Applied); n > 0 && e.Index != r.Applied[n-1].Index+1 {
-			return fmt.Errorf("node %d applied index %d after %d: entries must arrive in order",
-				r.id, e.Index, r.Applied[n-1].Index)
-		}
-		r.Applied = append(r.Applied, e)
-		r.cluster.Checker.RecordApply(r.cluster.tick, r.id, e)
-	}
-	return nil
-}
 
 // Cluster is a deterministic simulated Raft cluster.
 //
@@ -224,11 +218,12 @@ func (c *Cluster) newReplica(id raft.NodeID) (*Replica, error) {
 			"so the simulator could not make a crash cost what it really costs", store, id)
 	}
 
-	hs, ents, applied, err := store.InitialState()
+	rec, err := store.InitialState()
 	if err != nil {
 		return nil, err
 	}
-	if len(ents) == 0 {
+	hs, ents := rec.HardState, rec.Entries
+	if len(ents) == 0 && rec.Snapshot.IsEmpty() {
 		ents = c.Opts.InitialEntries[id]
 	}
 	if hs.IsEmpty() {
@@ -242,6 +237,7 @@ func (c *Cluster) newReplica(id raft.NodeID) (*Replica, error) {
 		ElectionTimeoutMaxTicks: c.Opts.ElectionTimeoutMaxTicks,
 		HeartbeatTimeoutTicks:   c.Opts.HeartbeatTimeoutTicks,
 		MaxEntriesPerAppend:     c.Opts.MaxEntriesPerAppend,
+		MaxSnapshotChunkBytes:   c.Opts.MaxSnapshotChunkBytes,
 		Rand: func(n int) int {
 			if n <= 0 {
 				return 0
@@ -249,8 +245,8 @@ func (c *Cluster) newReplica(id raft.NodeID) (*Replica, error) {
 			return rng.IntN(n)
 		},
 		HardState:      hs,
+		Snapshot:       rec.Snapshot,
 		Entries:        append([]raft.Entry(nil), ents...),
-		Applied:        applied,
 		UnsafeMutation: c.Opts.UnsafeMutation,
 	}
 
@@ -263,12 +259,26 @@ func (c *Cluster) newReplica(id raft.NodeID) (*Replica, error) {
 	if c.Opts.WrapTransport != nil {
 		trans = c.Opts.WrapTransport(id, trans)
 	}
-	rec := &Recorder{id: id, cluster: c}
+	var inner server.StateMachine = &Digest{}
+	if c.Opts.StateMachine != nil {
+		inner = c.Opts.StateMachine(id)
+	}
+	sm := &Recorder{id: id, cluster: c, Inner: inner}
+	// A node restarting from a snapshot rebuilds its state machine from it:
+	// the entries it covers are gone from the log and will never be applied.
+	if !rec.Snapshot.IsEmpty() {
+		if err := sm.Restore(rec.Snapshot); err != nil {
+			return nil, fmt.Errorf("testutil: restore node %d from snapshot: %w", id, err)
+		}
+	}
+
+	d := server.New(node, store, trans, sm)
+	d.SetSnapshotThreshold(c.Opts.SnapshotThreshold)
 	r := &Replica{
 		ID:     id,
-		Driver: server.New(node, store, trans, rec),
+		Driver: d,
 		Store:  store,
-		SM:     rec,
+		SM:     sm,
 		rng:    rng,
 	}
 	return r, nil
@@ -444,7 +454,17 @@ func (c *Cluster) Propose(id raft.NodeID, data []byte) (raft.Index, raft.Term, e
 	if r == nil || r.Down {
 		return 0, 0, fmt.Errorf("testutil: node %d is not running", id)
 	}
-	return r.Driver.Propose(raft.EntryNormal, data)
+	return c.ProposeType(id, raft.EntryNormal, data)
+}
+
+// ProposeType appends an entry of a given type through a node, which must be
+// the leader. The key-value tests use it to register client sessions.
+func (c *Cluster) ProposeType(id raft.NodeID, typ raft.EntryType, data []byte) (raft.Index, raft.Term, error) {
+	r := c.Replicas[id]
+	if r == nil || r.Down {
+		return 0, 0, fmt.Errorf("testutil: node %d is not running", id)
+	}
+	return r.Driver.Propose(typ, data)
 }
 
 // ProposeToLeader appends a command through whichever node currently leads.
@@ -483,10 +503,8 @@ func (c *Cluster) Restart(id raft.NodeID) error {
 	if err != nil {
 		return err
 	}
-	// The state machine is rebuilt from the log on restart, which in phase 2
-	// means replaying everything. Phase 4's snapshots are what stop that being
-	// the only option.
-	fresh.SM.Applied = nil
+	// The state machine was rebuilt from the latest snapshot, if there was
+	// one; the rest of the log is replayed into it as it commits.
 	c.Replicas[id] = fresh
 	delete(c.cachedLog, id)
 	delete(c.cachedRev, id)
@@ -592,9 +610,9 @@ func (c *Cluster) Describe() string {
 			continue
 		}
 		s := r.Node().Status()
-		out += fmt.Sprintf("  node %d: %-9s term=%-3d commit=%-3d applied=%-3d last=%d@%d log=%v\n",
-			id, s.Role, s.Term, s.CommitIndex, s.LastApplied, s.LastLogIndex, s.LastLogTerm,
-			summarize(r.Node().LogEntries()))
+		out += fmt.Sprintf("  node %d: %-9s term=%-3d commit=%-3d applied=%-3d snap=%d@%d last=%d@%d log=%v\n",
+			id, s.Role, s.Term, s.CommitIndex, s.LastApplied, s.SnapshotIndex, s.SnapshotTerm,
+			s.LastLogIndex, s.LastLogTerm, summarize(r.Node().LogEntries()))
 	}
 	out += fmt.Sprintf("  net: sent=%d delivered=%d dropped=%d dup=%d partitioned=%d inflight=%d\n",
 		c.Net.Stats.Sent, c.Net.Stats.Delivered, c.Net.Stats.Dropped,

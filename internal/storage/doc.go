@@ -10,15 +10,16 @@
 //	data/node-<id>/wal/000001.log          append-only segments
 //	data/node-<id>/snap/<index>-<term>.snap
 //
-// HardState is written as a record type inside the WAL rather than to a
-// separate file. That avoids atomic-rename and directory-fsync entirely,
-// neither of which is portable to Windows.
+// HardState is written inside WAL records rather than to a separate file. That
+// avoids atomic-rename, which is not portable to Windows.
 //
 // Record framing: [u32 length][u32 crc32c][u8 type][payload], with the CRC
 // covering length, type and payload. Each Sync writes exactly one EntryBatch
 // record holding that Ready's entries and, if it changed, its hard state, so a
 // torn write can only ever lose a whole batch. SnapshotPointer is the other
-// type; phase 4 writes it.
+// type: always the first record of its segment, naming a durable snapshot file
+// and carrying the log tail and hard state, so recovery starts from the last
+// one and never needs anything older.
 //
 // Invariants this package must uphold:
 //
@@ -33,9 +34,10 @@
 //     failed fsync left on disk is unknowable; only a restart that re-reads the
 //     disk is safe.
 //   - Snapshots are written payload-before-pointer: fsync the .snap file, then
-//     append and fsync a SnapshotPointer record, then delete superseded WAL
-//     segments. A crash at any point in that sequence leaves a recoverable
-//     state.
+//     roll to a fresh segment and append and fsync a SnapshotPointer record,
+//     then delete every older segment and snapshot file. A crash at any point
+//     in that sequence recovers to exactly the state before the snapshot or
+//     exactly the state after it (TestCrashDuringSnapshot).
 //
 // Scope of the durability guarantee: Sync calls File.Sync, which is
 // FlushFileBuffers on Windows and fsync on Unix. That protects against process
@@ -44,6 +46,7 @@
 //
 // MemStorage is the simulator's model of the same contract; WAL is the real
 // thing. Both apply batches through one function, so they cannot disagree
-// about what a batch means (TestWALAgreesWithMemStorage). Phase 3 built the
-// WAL; phase 4 adds snapshots.
+// about what a batch or a snapshot means (TestWALAgreesWithMemStorage,
+// TestWALAgreesWithMemStorageThroughSnapshots). Phase 3 built the WAL; phase 4
+// added snapshots and segment reclamation.
 package storage

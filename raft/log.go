@@ -4,15 +4,18 @@ import "fmt"
 
 // raftLog is the replicated log plus the three indices that move through it.
 //
-// Layout: entries[0] has index snapIndex+1. snapIndex is 0 until phase 4
-// introduces snapshots, so for now entries[0] is index 1 and the log is a plain
-// slice. The offset arithmetic is here from the start because retrofitting it
-// after compaction exists means auditing every index expression again.
+// Layout: entries[0] has index snapIndex+1. Everything at or below snapIndex
+// has been folded into a snapshot and exists only there; the log remembers the
+// last folded entry's index and term so the AppendEntries consistency check
+// still works at the boundary.
 //
 // Invariants, all asserted by tests:
 //
-//	snapIndex <= stable <= lastIndex()
-//	applied   <= committed <= lastIndex()
+//	snapIndex <= stable    <= lastIndex()
+//	snapIndex <= applied   <= committed <= lastIndex()
+//
+// snapIndex <= applied is what makes compaction safe: only state the state
+// machine already holds can be dropped from the log.
 //
 // committed <= lastIndex() is why a follower can never commit an entry it does
 // not have, no matter what a leader claims.
@@ -40,10 +43,13 @@ type raftLog struct {
 	revision uint64
 }
 
-func newLog(entries []Entry, applied Index) *raftLog {
+func newLog(snap SnapshotMeta, entries []Entry, applied Index) *raftLog {
 	l := &raftLog{
-		entries: append([]Entry(nil), entries...),
-		applied: applied,
+		snapIndex: snap.Index,
+		snapTerm:  snap.Term,
+		entries:   append([]Entry(nil), entries...),
+		applied:   max(applied, snap.Index),
+		committed: snap.Index,
 	}
 	l.stable = l.lastIndex()
 	return l
@@ -186,6 +192,59 @@ func (l *raftLog) unstableEntries() []Entry {
 		return nil
 	}
 	return l.slice(l.stable+1, l.lastIndex()+1)
+}
+
+// compact folds everything up to and including i into a snapshot: the entries
+// are dropped and only i's term is remembered, for the consistency check at the
+// new boundary.
+//
+// It refuses to compact anything the state machine has not applied. Dropping an
+// unapplied entry would leave the node unable to reach the state the snapshot
+// claims to describe.
+func (l *raftLog) compact(i Index) error {
+	switch {
+	case i <= l.snapIndex:
+		return fmt.Errorf("raft: cannot compact to %d, already compacted to %d", i, l.snapIndex)
+	case i > l.applied:
+		return fmt.Errorf("raft: cannot compact to %d, only %d is applied", i, l.applied)
+	case i > l.stable:
+		return fmt.Errorf("raft: cannot compact to %d, only %d is durable", i, l.stable)
+	}
+	t, _ := l.term(i)
+	// Copy rather than reslice, so the compacted prefix can actually be
+	// reclaimed instead of staying pinned by the backing array.
+	l.entries = append([]Entry(nil), l.entries[i-l.snapIndex:]...)
+	l.snapIndex, l.snapTerm = i, t
+	l.revision++
+	return nil
+}
+
+// restore adopts a snapshot received from the leader.
+//
+// The rule is the one in Figure 13: if the log already holds the snapshot's
+// last entry, with the same term, everything after it is still valid and is
+// kept. Otherwise the whole log is discarded, because nothing in it can be
+// shown to agree with the leader. Storage applies the same rule when it
+// persists the snapshot (internal/storage), so the durable log and this one
+// cannot disagree about what survived.
+//
+// The caller has already checked that the snapshot is ahead of the commit
+// index, so nothing committed is lost here: everything committed is inside
+// the snapshot.
+func (l *raftLog) restore(m SnapshotMeta) {
+	if l.matchTerm(m.Index, m.Term) {
+		l.entries = append([]Entry(nil), l.entries[m.Index-l.snapIndex:]...)
+	} else {
+		l.entries = nil
+	}
+	l.snapIndex, l.snapTerm = m.Index, m.Term
+	l.committed = max(l.committed, m.Index)
+	l.applied = m.Index
+	// The entries at or below the snapshot are durable once the Ready that
+	// carries the snapshot is. Anything kept above it keeps whatever
+	// durability it already had.
+	l.stable = min(max(l.stable, m.Index), l.lastIndex())
+	l.revision++
 }
 
 // findConflict locates where incoming entries first disagree with the log.

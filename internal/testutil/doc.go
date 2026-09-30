@@ -11,13 +11,19 @@
 //	Leader Completeness  a committed entry appears in every future leader's log
 //	State Machine Safety no two nodes apply different commands at one index
 //
+// plus two of its own: CommittedEntriesAreStable, the direct form of "a
+// committed entry is never altered", and SnapshotFidelity, which compares every
+// replica's state-machine hash at every applied index so that a replica rebuilt
+// from a snapshot is checked as strictly as one that applied every entry. The
+// default state machine, Digest, is a running hash of everything applied, which
+// makes that comparison cheap enough to run on every tick.
+//
 // A checker nobody has tested is worth very little, so the suite also carries
-// negative controls: deliberately mutated Raft implementations that each
-// checker must catch. A checker that has never been shown to fail is not
-// evidence of anything.
+// negative controls: deliberately mutated Raft implementations, and
+// deliberately broken storage and state machines, that each checker must
+// catch. A checker that has never been shown to fail is not evidence of
+// anything.
 //
-// This package also holds the Porcupine model used to verify that recorded
-// client histories are linearizable.
-//
-// Phase 2 fills this package in. It is currently a documented stub.
+// Phase 5 adds the Porcupine model used to verify that recorded client
+// histories are linearizable.
 package testutil

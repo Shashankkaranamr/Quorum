@@ -97,15 +97,26 @@ type Config struct {
 	// MaxEntriesPerAppend caps how many entries one AppendEntries carries.
 	MaxEntriesPerAppend int
 
+	// MaxSnapshotChunkBytes caps the data one InstallSnapshot carries. Zero
+	// means DefaultMaxSnapshotChunkBytes. A snapshot larger than this is sent
+	// in chunks, each acknowledged before the next, so a transfer interrupted
+	// by a lost message resumes where it stopped instead of starting over.
+	MaxSnapshotChunkBytes int
+
 	// Rand returns a value in [0, n). It is the only source of nondeterminism
 	// in the core, and injecting it is what lets a failing randomized trial be
 	// reproduced from its seed alone.
 	Rand func(n int) int
 
-	// Restored state. Phase 3 populates these from the write-ahead log; until
-	// then they are zero for a fresh node, or set directly by tests that need
-	// to construct a specific history.
+	// Restored state, as recovered from storage: zero for a fresh node, or
+	// set directly by tests that need to construct a specific history.
+	//
+	// Snapshot is the latest durable snapshot, if any. Entries must continue
+	// directly from it: the first entry's index is Snapshot.Meta.Index+1. The
+	// caller restores the state machine from the same snapshot, so the node
+	// treats everything up to its index as both committed and applied.
 	HardState HardState
+	Snapshot  Snapshot
 	Entries   []Entry
 	Applied   Index
 
@@ -113,6 +124,10 @@ type Config struct {
 	// the Mutation documentation for why it exists at all.
 	UnsafeMutation Mutation
 }
+
+// DefaultMaxSnapshotChunkBytes is the InstallSnapshot chunk size used when
+// Config.MaxSnapshotChunkBytes is zero.
+const DefaultMaxSnapshotChunkBytes = 64 << 10
 
 var (
 	// ErrNotLeader is returned by Propose on a node that is not the leader.
@@ -163,6 +178,16 @@ func (c *Config) validate() error {
 		return fmt.Errorf("raft: MaxEntriesPerAppend must be at least 1, got %d",
 			c.MaxEntriesPerAppend)
 	}
+	if c.MaxSnapshotChunkBytes < 0 {
+		return fmt.Errorf("raft: MaxSnapshotChunkBytes must not be negative, got %d",
+			c.MaxSnapshotChunkBytes)
+	}
+	if len(c.Entries) > 0 {
+		if first, want := c.Entries[0].Index, c.Snapshot.Meta.Index+1; first != want {
+			return fmt.Errorf("raft: restored log starts at index %d but the snapshot ends at %d; "+
+				"the log must continue directly from the snapshot", first, c.Snapshot.Meta.Index)
+		}
+	}
 	if c.Rand == nil {
 		return errors.New("raft: Config.Rand must be supplied; the core draws no randomness of its own")
 	}
@@ -172,3 +197,10 @@ func (c *Config) validate() error {
 // quorum is the number of nodes that must agree. It is computed from the static
 // peer set, so it never changes for the lifetime of a node.
 func (c *Config) quorum() int { return len(c.Peers)/2 + 1 }
+
+func (c *Config) chunkBytes() int {
+	if c.MaxSnapshotChunkBytes == 0 {
+		return DefaultMaxSnapshotChunkBytes
+	}
+	return c.MaxSnapshotChunkBytes
+}
